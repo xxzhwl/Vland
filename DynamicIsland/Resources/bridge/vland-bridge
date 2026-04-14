@@ -1,0 +1,1539 @@
+#!/usr/bin/env python3
+"""
+Vland AI Agent Bridge
+=====================
+This script is called by CodeBuddy/Codex/Claude Code/WorkBuddy hooks.
+It reads hook context from stdin (JSON) and environment variables,
+normalizes agent-specific payloads through hook/source adapters,
+then sends an event to Vland via Unix Domain Socket.
+
+Hook stdin fields (discovered from actual hook data):
+  - hook_event_name: "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", etc.
+  - prompt: user's question (on UserPromptSubmit)
+  - tool_name: e.g. "Bash", "Read File", "Edit File"
+  - tool_input: dict with tool parameters
+  - tool_response: tool execution result (on PostToolUse)
+  - session_id, cwd, transcript_path, model, client, version
+"""
+
+import json
+import os
+import socket
+import sys
+import time
+import argparse
+import hashlib
+from datetime import datetime
+
+SOCKET_PATH = os.path.join(os.environ.get("TMPDIR", "/tmp"), "vland-ai-agent.sock")
+
+MAX_PROMPT_LEN = 2000
+
+# Debug logging for transcript path troubleshooting
+def debug_log(msg):
+    try:
+        with open("/tmp/vland-bridge-debug.log", "a") as f:
+            f.write(f"[{datetime.now().isoformat()}] {msg}\n")
+    except:
+        pass
+MAX_OUTPUT_LEN = 2000
+MAX_TOOL_INPUT_LEN = 500
+MAX_TOOL_OUTPUT_LEN = 1000
+MAX_MESSAGE_LEN = 500
+TRANSCRIPT_TAIL_BYTES = 1024 * 1024
+TRANSCRIPT_TAIL_LINES = 2000
+STREAM_HOOK_TYPES = {"PostToolUse", "Stop", "SessionEnd", "Notification"}
+STREAM_STATE_DIR = os.path.join(os.path.expanduser("~"), ".vland", "state")
+BRIDGE_RESPONSE_TIMEOUT = 120
+
+
+def truncate(s, max_len):
+    """Truncate a string, appending '...' if truncated."""
+    if s and isinstance(s, str) and len(s) > max_len:
+        return s[:max_len - 3] + "..."
+    return s
+
+
+def parse_stdin():
+    """Read JSON from stdin if available."""
+    try:
+        if not sys.stdin.isatty():
+            raw = sys.stdin.read().strip()
+            if raw:
+                return json.loads(raw)
+    except (json.JSONDecodeError, IOError):
+        pass
+    return {}
+
+
+def extract_session_id(stdin_data):
+    """Extract a stable session ID, falling back to transcript identity."""
+    session_id = extract_string_field(
+        stdin_data,
+        "session_id",
+        "sessionId",
+        "conversation_id",
+        "conversationId",
+        "chat_id",
+        "chatId",
+        "thread_id",
+        "threadId",
+        "run_id",
+        "runId",
+    ) or os.environ.get("CODEX_SESSION_ID") \
+        or os.environ.get("CODEBUDDY_SESSION_ID") \
+        or os.environ.get("WORKBUDDY_SESSION_ID")
+    if session_id:
+        return session_id
+
+    transcript_path = normalized_transcript_path(stdin_data)
+    if transcript_path:
+        digest = hashlib.sha1(transcript_path.encode("utf-8")).hexdigest()[:16]
+        return f"transcript:{digest}"
+
+    return None
+
+
+def extract_string_field(container, *keys):
+    if not isinstance(container, dict):
+        return None
+
+    for key in keys:
+        value = container.get(key)
+        if value is None:
+            continue
+
+        text = str(value).strip()
+        if text:
+            return text
+
+    return None
+
+
+def extract_int_field(container, *keys):
+    """Extract an integer field from a container (dict)."""
+    if not isinstance(container, dict):
+        return None
+
+    for key in keys:
+        value = container.get(key)
+        if value is None:
+            continue
+
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            continue
+
+    return None
+
+
+def extract_optional_int(value):
+    if value is None:
+        return None
+
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_process_id(stdin_data):
+    for key in ("pid", "process_id", "processId", "agent_pid", "agentPid"):
+        pid = extract_optional_int(stdin_data.get(key))
+        if pid is not None:
+            return pid
+
+    return os.getppid()
+
+
+def extract_terminal_tty():
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            fd = stream.fileno()
+        except (AttributeError, OSError, ValueError):
+            continue
+
+        try:
+            if os.isatty(fd):
+                return os.ttyname(fd)
+        except OSError:
+            continue
+
+    try:
+        fd = os.open("/dev/tty", os.O_RDONLY)
+    except OSError:
+        return None
+
+    try:
+        return os.ttyname(fd)
+    except OSError:
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def normalized_transcript_path(stdin_data, source=None):
+    transcript_path = extract_string_field(stdin_data, "transcript_path", "transcriptPath")
+    if transcript_path:
+        result = os.path.realpath(transcript_path)
+        debug_log(f"transcript_path resolved: {result}")
+        return result
+
+    # Claude Code doesn't provide transcript_path in hook data.
+    # Infer it from session_id + cwd: ~/.claude/projects/<cwd-hash>/<session-id>.jsonl
+    if source == "claude-code":
+        inferred = infer_claude_transcript_path(stdin_data)
+        if inferred:
+            debug_log(f"transcript_path inferred for claude-code: {inferred}")
+            return inferred
+
+    # Debug: log when transcript_path is missing
+    debug_log(f"transcript_path missing from stdin_data keys: {list(stdin_data.keys())[:20]}")
+    return None
+
+
+def infer_claude_transcript_path(stdin_data):
+    """Infer Claude Code transcript path from session_id and cwd.
+
+    Claude Code stores transcripts at:
+      ~/.claude/projects/<cwd-hash>/<session-id>.jsonl
+
+    where <cwd-hash> is the cwd path with '/' replaced by '-'.
+    """
+    session_id = extract_string_field(stdin_data, "session_id", "sessionId")
+    if not session_id:
+        return None
+
+    cwd = extract_string_field(stdin_data, "cwd", "project", "workingDirectory")
+    if not cwd:
+        cwd = os.getcwd()
+
+    # Claude Code transforms cwd: /Users/foo/dev/MyProject -> -Users-foo-dev-MyProject
+    cwd_hash = "-" + cwd.replace("/", "-") if not cwd.startswith("/") else cwd.replace("/", "-")
+
+    home = os.path.expanduser("~")
+    candidate = os.path.join(home, ".claude", "projects", cwd_hash, f"{session_id}.jsonl")
+
+    if os.path.isfile(candidate):
+        return candidate
+
+    return None
+
+
+def extract_tool_use_id(stdin_data):
+    direct = extract_string_field(
+        stdin_data,
+        "tool_use_id",
+        "toolUseId",
+        "call_id",
+        "callId",
+        "request_id",
+        "requestId",
+    )
+    if direct:
+        return direct
+
+    tool_input = parse_tool_input(stdin_data)
+    return extract_string_field(
+        tool_input,
+        "tool_use_id",
+        "toolUseId",
+        "call_id",
+        "callId",
+        "request_id",
+        "requestId",
+    )
+
+
+def get_hook_type(stdin_data):
+    """Determine hook type from stdin data or environment."""
+    # CodeBuddy uses 'hook_event_name'
+    # Claude Code uses 'hook_type' or env CLAUDE_CODE_HOOK_EVENT_NAME
+    for key in ["hook_event_name", "hookEventName", "hook_type", "hookType", "event"]:
+        val = stdin_data.get(key)
+        if val:
+            return val
+
+    for var in ["CODEBUDDY_HOOK_TYPE", "CODEX_HOOK_TYPE",
+                "CODEX_HOOK_EVENT_NAME", "CLAUDE_CODE_HOOK_EVENT_NAME",
+                "WORKBUDDY_HOOK_TYPE", "HOOK_TYPE"]:
+        val = os.environ.get(var)
+        if val:
+            return val
+
+    return "Unknown"
+
+
+def extract_user_prompt(stdin_data):
+    """Extract the user's prompt/question from hook data."""
+    # CodeBuddy sends 'prompt' on UserPromptSubmit
+    for key in ["prompt", "user_prompt", "userPrompt", "query",
+                "user_message", "userMessage", "message"]:
+        val = stdin_data.get(key)
+        if val and isinstance(val, str) and len(val.strip()) > 0:
+            return truncate(val.strip(), MAX_PROMPT_LEN)
+
+    # Some agents nest the prompt in an input object
+    inp = stdin_data.get("input")
+    if isinstance(inp, dict):
+        for key in ["prompt", "message", "content", "query"]:
+            val = inp.get(key)
+            if val and isinstance(val, str):
+                return truncate(val, MAX_PROMPT_LEN)
+
+    return None
+
+
+def extract_tool_response(stdin_data):
+    """Extract tool execution output/result from hook data."""
+    # CodeBuddy sends 'tool_response' on PostToolUse
+    for key in ["tool_response", "tool_output", "toolOutput",
+                "tool_result", "toolResult"]:
+        val = stdin_data.get(key)
+        if val:
+            if isinstance(val, str):
+                return truncate(val, MAX_TOOL_OUTPUT_LEN)
+            elif isinstance(val, dict):
+                # Try to get a text representation
+                text = (val.get("text") or val.get("content")
+                        or val.get("output") or val.get("result")
+                        or val.get("stdout"))
+                if text and isinstance(text, str):
+                    return truncate(text, MAX_TOOL_OUTPUT_LEN)
+                return truncate(json.dumps(val, ensure_ascii=False),
+                                MAX_TOOL_OUTPUT_LEN)
+            elif isinstance(val, (list, int, float, bool)):
+                return truncate(str(val), MAX_TOOL_OUTPUT_LEN)
+    return None
+
+
+def extract_agent_output(stdin_data):
+    """Extract the agent's response/output text from hook data."""
+    # First try direct fields
+    for key in ["agent_output", "agentOutput", "response",
+                "last_assistant_message", "lastAssistantMessage",
+                "assistant_message", "assistantMessage"]:
+        val = stdin_data.get(key)
+        if val and isinstance(val, str):
+            return truncate(val, MAX_OUTPUT_LEN)
+
+    # Check nested output/result dicts
+    for key in ["output", "result"]:
+        val = stdin_data.get(key)
+        if isinstance(val, dict):
+            text = val.get("text") or val.get("content") or val.get("message")
+            if text and isinstance(text, str):
+                return truncate(text, MAX_OUTPUT_LEN)
+
+    # For Stop events, try reading from transcript file
+    hook_type = (stdin_data.get("hook_event_name") or stdin_data.get("hook_type")
+                 or stdin_data.get("hookType") or "")
+    if hook_type in ("Stop", "SessionEnd"):
+        return extract_agent_output_from_transcript(stdin_data)
+
+    return None
+
+
+def extract_agent_output_from_transcript(stdin_data):
+    """Read the latest assistant text from transcript (jsonl or legacy format)."""
+    latest = extract_latest_agent_message(stdin_data)
+    if latest:
+        return truncate(latest.get("message"), MAX_OUTPUT_LEN)
+    return None
+
+
+def extract_latest_agent_message(stdin_data):
+    """Extract latest agent message from transcript path."""
+    transcript_path = normalized_transcript_path(stdin_data)
+    if not transcript_path:
+        return None
+
+    # Codex transcript format: line-delimited JSON events in *.jsonl
+    msg = extract_latest_agent_message_from_jsonl(transcript_path)
+    if msg:
+        return msg
+
+    # Legacy transcript format with messages directory
+    return extract_latest_agent_message_from_legacy_index(transcript_path)
+
+
+def extract_latest_agent_message_from_jsonl(transcript_path):
+    """Extract latest `agent_message` from Codex jsonl transcript."""
+    if not os.path.isfile(transcript_path):
+        return None
+
+    lines = read_tail_lines(transcript_path, TRANSCRIPT_TAIL_BYTES, TRANSCRIPT_TAIL_LINES)
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        # Preferred source: event_msg.agent_message
+        if entry.get("type") == "event_msg":
+            payload = entry.get("payload", {})
+            if not isinstance(payload, dict):
+                continue
+
+            payload_type = payload.get("type")
+            if payload_type == "agent_message":
+                message = payload.get("message")
+                if isinstance(message, str) and message.strip():
+                    return {
+                        "message": message.strip(),
+                        "timestamp": entry.get("timestamp"),
+                        "phase": payload.get("phase"),
+                    }
+            if payload_type == "task_complete":
+                message = payload.get("last_agent_message")
+                if isinstance(message, str) and message.strip():
+                    return {
+                        "message": message.strip(),
+                        "timestamp": entry.get("timestamp"),
+                        "phase": "final_answer",
+                    }
+
+        # Fallback: response_item assistant output_text
+        if entry.get("type") == "response_item":
+            payload = entry.get("payload", {})
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("type") != "message" or payload.get("role") != "assistant":
+                continue
+            content = payload.get("content")
+            if not isinstance(content, list):
+                continue
+            texts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "output_text":
+                    text = block.get("text")
+                    if isinstance(text, str) and text:
+                        texts.append(text)
+            if texts:
+                return {
+                    "message": "\n".join(texts).strip(),
+                    "timestamp": entry.get("timestamp"),
+                    "phase": payload.get("phase"),
+                }
+
+    return None
+
+
+def extract_latest_agent_message_from_legacy_index(transcript_path):
+    """Extract latest assistant text from legacy transcript index + messages dir."""
+    try:
+        messages_dir = os.path.join(os.path.dirname(transcript_path), "messages")
+        if not os.path.isdir(messages_dir):
+            return None
+
+        # Read index to find last assistant message id
+        with open(transcript_path, "r") as f:
+            index = json.load(f)
+
+        messages = index.get("messages", [])
+        # Walk backwards to find last assistant message
+        for msg_meta in reversed(messages):
+            if msg_meta.get("role") == "assistant":
+                msg_id = msg_meta.get("id")
+                if not msg_id:
+                    continue
+                msg_file = os.path.join(messages_dir, f"{msg_id}.json")
+                if not os.path.exists(msg_file):
+                    continue
+
+                with open(msg_file, "r") as f:
+                    msg_data = json.load(f)
+
+                # The 'message' field is a JSON string containing {role, content}
+                raw_message = msg_data.get("message", "")
+                if not raw_message:
+                    continue
+
+                try:
+                    parsed = json.loads(raw_message)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+                content = parsed.get("content", [])
+                if isinstance(content, str):
+                    return {
+                        "message": content,
+                        "timestamp": None,
+                        "phase": None,
+                    }
+                elif isinstance(content, list):
+                    # Extract all text blocks
+                    texts = []
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            t = block.get("text", "")
+                            if t:
+                                texts.append(t)
+                    if texts:
+                        return {
+                            "message": "\n".join(texts),
+                            "timestamp": None,
+                            "phase": None,
+                        }
+                break  # Only try the latest assistant message
+    except (IOError, json.JSONDecodeError, KeyError, TypeError):
+        pass
+
+    return None
+
+
+def read_tail_lines(path, max_bytes, max_lines):
+    """Read only tail lines to avoid scanning large transcripts each hook call."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            start = max(0, size - max_bytes)
+            f.seek(start)
+            if start > 0:
+                # Skip partial first line
+                f.readline()
+            data = f.read().decode("utf-8", errors="ignore")
+    except OSError:
+        return []
+
+    return data.splitlines()[-max_lines:]
+
+
+def stream_state_path(source, stdin_data):
+    """Build per-session state path used to deduplicate streamed text."""
+    session_id = extract_session_id(stdin_data)
+    transcript_path = normalized_transcript_path(stdin_data)
+    identity = session_id or transcript_path or "default"
+    key = f"{source}:{identity}"
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
+    return os.path.join(STREAM_STATE_DIR, f"{source}-{digest}.json")
+
+
+def load_stream_state(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+
+
+def save_stream_state(path, state):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def clear_stream_state(path):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def maybe_send_agent_response_event(source, stdin_data, base_event):
+    """Emit an extra AgentResponse event when transcript has newer text."""
+    hook_type = get_hook_type(stdin_data)
+    if hook_type not in STREAM_HOOK_TYPES:
+        return
+
+    latest = extract_latest_agent_message(stdin_data)
+    if not latest:
+        return
+
+    message = latest.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return
+
+    message = message.strip()
+    phase = latest.get("phase") or ""
+    ts = latest.get("timestamp") or ""
+    fingerprint = hashlib.sha1(f"{ts}|{phase}|{message}".encode("utf-8")).hexdigest()
+
+    state_path = stream_state_path(source, stdin_data)
+    state = load_stream_state(state_path)
+    if state.get("last_agent_fingerprint") == fingerprint:
+        return
+
+    event = dict(base_event)
+    event["hook_type"] = "AgentResponse"
+    event["timestamp"] = time.time()
+    event["agent_output"] = truncate(message, MAX_OUTPUT_LEN)
+    event["message"] = truncate(message, MAX_MESSAGE_LEN)
+
+    send_event(event)
+    save_stream_state(state_path, {"last_agent_fingerprint": fingerprint})
+
+
+def parse_tool_input(stdin_data):
+    tool_input = (stdin_data.get("tool_input") or stdin_data.get("toolInput")
+                  or stdin_data.get("input"))
+    if isinstance(tool_input, str):
+        try:
+            return json.loads(tool_input)
+        except (json.JSONDecodeError, TypeError):
+            return tool_input
+    return tool_input
+
+
+def extract_tool_input_summary(stdin_data):
+    """Extract a summary of tool input parameters."""
+    tool_input = parse_tool_input(stdin_data)
+    tool_name = (stdin_data.get("tool_name") or stdin_data.get("toolName") or "").lower()
+    file_path = None
+
+    if isinstance(tool_input, str):
+        return truncate(tool_input, MAX_TOOL_INPUT_LEN), file_path
+
+    if isinstance(tool_input, dict):
+        # Extract file path from various field names
+        file_path = (tool_input.get("filePath") or tool_input.get("file_path")
+                     or tool_input.get("target_file") or tool_input.get("path")
+                     or tool_input.get("target_directory"))
+
+        if tool_name in ("task", "agent"):
+            subtask = (tool_input.get("description") or tool_input.get("prompt")
+                       or tool_input.get("title") or tool_input.get("task")
+                       or tool_input.get("message"))
+            if subtask:
+                return truncate(str(subtask), MAX_TOOL_INPUT_LEN), file_path
+
+        if tool_name in ("askuserquestion", "ask_followup_question", "askfollowupquestion"):
+            questions = normalize_questions(tool_input.get("questions"))
+            if questions:
+                first_question = questions[0].get("question")
+                if first_question:
+                    return truncate(first_question, MAX_TOOL_INPUT_LEN), file_path
+
+        # For execute_command / Bash, extract command
+        command = tool_input.get("command") or tool_input.get("cmd")
+        if command:
+            return truncate(str(command), MAX_TOOL_INPUT_LEN), file_path
+
+        # For search, extract the query/pattern
+        pattern = (tool_input.get("pattern") or tool_input.get("query")
+                   or tool_input.get("queryString") or tool_input.get("regex"))
+        if pattern:
+            return truncate(str(pattern), MAX_TOOL_INPUT_LEN), file_path
+
+        # For explanations (CodeBuddy style)
+        explanation = tool_input.get("explanation")
+
+        # Return file path or explanation or brief JSON
+        if file_path:
+            return file_path, file_path
+        if explanation:
+            return truncate(str(explanation), MAX_TOOL_INPUT_LEN), file_path
+
+        return truncate(json.dumps(tool_input, ensure_ascii=False),
+                        MAX_TOOL_INPUT_LEN), file_path
+
+    return None, file_path
+
+
+def parse_json_array(value):
+    if isinstance(value, list):
+        return value
+    if not isinstance(value, str):
+        return None
+
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    return parsed if isinstance(parsed, list) else None
+
+
+def normalize_option_labels(options):
+    if not isinstance(options, list):
+        return None
+
+    normalized = []
+    for option in options:
+        label = None
+        if isinstance(option, str):
+            label = option
+        elif isinstance(option, dict):
+            label = (option.get("label") or option.get("title")
+                     or option.get("value") or option.get("text")
+                     or option.get("name"))
+        if not label:
+            continue
+        normalized.append(truncate(str(label), 120))
+
+    return normalized if normalized else None
+
+
+def normalize_questions(questions):
+    questions = parse_json_array(questions)
+    if not isinstance(questions, list):
+        return None
+
+    normalized = []
+    for index, question in enumerate(questions):
+        if not isinstance(question, dict):
+            continue
+
+        text = question.get("question") or question.get("prompt") or question.get("message")
+        if not isinstance(text, str) or not text.strip():
+            continue
+
+        normalized.append({
+            "id": str(question.get("id") or question.get("header") or index + 1),
+            "question": truncate(text.strip(), MAX_PROMPT_LEN),
+            "options": normalize_option_labels(question.get("options")) or [],
+            "multiSelect": bool(question.get("multiSelect")),
+        })
+
+    return normalized if normalized else None
+
+
+def encode_bridge_response_context(context):
+    try:
+        return json.dumps(context, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_interaction_payload(interaction_type, title, questions,
+                              response_mode=None, bridge_response_kind=None,
+                              bridge_response_context=None):
+    interaction = {
+        "type": interaction_type,
+        "title": title,
+        "questions": questions,
+    }
+    if response_mode:
+        interaction["responseMode"] = response_mode
+    if bridge_response_kind:
+        interaction["bridgeResponseKind"] = bridge_response_kind
+    if bridge_response_context:
+        interaction["bridgeResponseContext"] = bridge_response_context
+    return interaction
+
+
+def build_approval_interaction(message, title="Command Approval Required",
+                               bridge_response_kind=None,
+                               bridge_response_context=None):
+    return build_interaction_payload(
+        interaction_type="confirmation",
+        title=title,
+        response_mode="approval_selection",
+        bridge_response_kind=bridge_response_kind,
+        bridge_response_context=bridge_response_context,
+        questions=[{
+            "id": "approval",
+            "question": message,
+            "options": ["Allow", "Block"],
+            "multiSelect": False,
+        }],
+    )
+
+
+def compose_permission_message(tool_name, tool_input):
+    display_name = str(tool_name or "Tool").strip() or "Tool"
+    description = None
+    summary = None
+
+    if isinstance(tool_input, dict):
+        description = tool_input.get("description") or tool_input.get("justification")
+        summary, _ = extract_tool_input_summary({
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+        })
+
+    pieces = []
+    if isinstance(description, str) and description.strip():
+        pieces.append(description.strip())
+    if isinstance(summary, str) and summary.strip() and summary.strip() != description:
+        pieces.append(summary.strip())
+
+    if pieces:
+        return "\n\n".join(pieces)
+    return f"Allow {display_name}?"
+
+
+def extract_direct_tool_approval_interaction(source, stdin_data):
+    tool_input = parse_tool_input(stdin_data)
+    if not isinstance(tool_input, dict):
+        return None
+
+    justification = tool_input.get("justification")
+    sandbox_permissions = (tool_input.get("sandbox_permissions")
+                           or tool_input.get("sandboxPermissions"))
+    if sandbox_permissions != "require_escalated" or not isinstance(justification, str) or not justification.strip():
+        return None
+
+    command = tool_input.get("cmd") or tool_input.get("command")
+    message = justification.strip()
+    if command:
+        message = f"{message}\n\n{truncate(str(command), MAX_TOOL_INPUT_LEN)}"
+
+    bridge_response_kind = None
+    if source in ("codebuddy", "workbuddy"):
+        bridge_response_kind = "codebuddy_approval"
+
+    return build_approval_interaction(message, bridge_response_kind=bridge_response_kind)
+
+
+def extract_permission_request_interaction(source, stdin_data):
+    if get_hook_type(stdin_data) != "PermissionRequest":
+        return None
+
+    tool_name = stdin_data.get("tool_name") or stdin_data.get("toolName") or "Tool"
+    tool_input = parse_tool_input(stdin_data)
+    title = f"{tool_name} Permission Required"
+    return build_approval_interaction(
+        message=compose_permission_message(tool_name, tool_input),
+        title=title,
+        bridge_response_kind="claude_permission_request" if source == "claude-code" else None,
+    )
+
+
+def extract_question_interaction(source, stdin_data):
+    tool_name = (stdin_data.get("tool_name") or stdin_data.get("toolName") or "").lower()
+    if "follow" not in tool_name and "question" not in tool_name:
+        return None
+
+    tool_input = parse_tool_input(stdin_data)
+    if not isinstance(tool_input, dict):
+        return None
+
+    questions = normalize_questions(tool_input.get("questions"))
+    if not questions:
+        return None
+
+    interaction_type = tool_input.get("type") or ("confirmation" if "confirm" in tool_name else "question")
+    title = tool_input.get("title")
+    bridge_response_kind = None
+    bridge_response_context = None
+
+    if source == "claude-code" and tool_name == "askuserquestion" and len(questions) == 1:
+        first_question = questions[0]
+        if not first_question.get("multiSelect") and first_question.get("options"):
+            bridge_response_kind = "claude_ask_user_question"
+            bridge_response_context = encode_bridge_response_context({
+                "tool_input": tool_input,
+                "question": first_question.get("question"),
+            })
+
+    # CodeBuddy / WorkBuddy also support PreToolUse modifiedInput write-back
+    if source in ("codebuddy", "workbuddy") and len(questions) == 1:
+        first_question = questions[0]
+        if not first_question.get("multiSelect") and first_question.get("options"):
+            bridge_response_kind = "codebuddy_ask_user_question"
+            bridge_response_context = encode_bridge_response_context({
+                "tool_input": tool_input,
+                "question": first_question.get("question"),
+            })
+
+    return build_interaction_payload(
+        interaction_type=interaction_type,
+        title=title,
+        response_mode=None,
+        bridge_response_kind=bridge_response_kind,
+        bridge_response_context=bridge_response_context,
+        questions=questions,
+    )
+
+
+def extract_transcript_approval_interaction(source, stdin_data):
+    tool_input = parse_tool_input(stdin_data)
+    current_command = tool_input.get("cmd") or tool_input.get("command") if isinstance(tool_input, dict) else None
+    bridge_response_kind = "codebuddy_approval" if source in ("codebuddy", "workbuddy") else None
+    return extract_pending_approval_from_transcript(stdin_data, current_command=current_command, bridge_response_kind=bridge_response_kind)
+
+
+_HOOK_INTERACTION_EXTRACTORS = {
+    "PermissionRequest": [extract_permission_request_interaction],
+    "PreToolUse": [
+        extract_direct_tool_approval_interaction,
+        extract_question_interaction,
+        extract_transcript_approval_interaction,
+    ],
+}
+
+
+def extract_interaction(source, stdin_data):
+    """Extract interaction data for approvals and question tools."""
+    hook_type = get_hook_type(stdin_data)
+    for extractor in _HOOK_INTERACTION_EXTRACTORS.get(hook_type, []):
+        interaction = extractor(source, stdin_data)
+        if interaction:
+            return interaction
+    return None
+
+
+def normalize_command_text(command):
+    if not isinstance(command, str):
+        return None
+    compact = " ".join(command.strip().split())
+    return compact or None
+
+
+def extract_pending_approval_from_transcript(stdin_data, current_command=None, bridge_response_kind=None):
+    transcript_path = normalized_transcript_path(stdin_data)
+    if not transcript_path or not os.path.isfile(transcript_path):
+        return None
+
+    target_command = normalize_command_text(current_command)
+    completed_call_ids = set()
+    lines = read_tail_lines(transcript_path, TRANSCRIPT_TAIL_BYTES, TRANSCRIPT_TAIL_LINES)
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        entry_type = entry.get("type")
+        payload = entry.get("payload")
+        if not isinstance(payload, dict):
+            continue
+
+        if entry_type == "response_item" and payload.get("type") == "function_call_output":
+            call_id = payload.get("call_id")
+            if call_id:
+                completed_call_ids.add(call_id)
+            continue
+
+        if entry_type == "event_msg" and payload.get("type") == "exec_command_end":
+            call_id = payload.get("call_id")
+            if call_id:
+                completed_call_ids.add(call_id)
+            continue
+
+        if entry_type != "response_item" or payload.get("type") != "function_call":
+            continue
+
+        if payload.get("name") != "exec_command":
+            continue
+
+        call_id = payload.get("call_id")
+        if call_id and call_id in completed_call_ids:
+            continue
+
+        arguments = payload.get("arguments")
+        if not isinstance(arguments, str):
+            continue
+
+        try:
+            arguments_data = json.loads(arguments)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        if not isinstance(arguments_data, dict):
+            continue
+
+        justification = arguments_data.get("justification")
+        sandbox_permissions = (arguments_data.get("sandbox_permissions")
+                               or arguments_data.get("sandboxPermissions"))
+        if sandbox_permissions != "require_escalated" or not isinstance(justification, str) or not justification.strip():
+            continue
+
+        command = arguments_data.get("cmd") or arguments_data.get("command")
+        normalized_command = normalize_command_text(command)
+        if target_command and normalized_command and normalized_command != target_command:
+            continue
+
+        message = justification.strip()
+        if command:
+            message = f"{message}\n\n{truncate(str(command), MAX_TOOL_INPUT_LEN)}"
+        return build_approval_interaction(message, bridge_response_kind=bridge_response_kind)
+
+    return None
+
+
+def parse_iso_timestamp(value):
+    if not value or not isinstance(value, str):
+        return None
+
+    try:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return None
+
+
+def normalize_subtask_title(text):
+    if not text or not isinstance(text, str):
+        return None
+
+    compact = " ".join(text.strip().split())
+    if not compact:
+        return None
+
+    return truncate(compact, 180)
+
+
+def normalize_subtask_summary(text):
+    if not text or not isinstance(text, str):
+        return None
+
+    compact = " ".join(text.strip().split())
+    if not compact:
+        return None
+
+    return truncate(compact, 240)
+
+
+def normalize_plan_subtasks(plan_payload):
+    if not isinstance(plan_payload, dict):
+        return None
+
+    plan_items = plan_payload.get("plan")
+    if not isinstance(plan_items, list):
+        return None
+
+    shared_summary = normalize_subtask_summary(plan_payload.get("explanation"))
+    normalized = []
+    for index, item in enumerate(plan_items):
+        if not isinstance(item, dict):
+            continue
+
+        title = normalize_subtask_title(
+            item.get("step") or item.get("title") or item.get("content")
+        )
+        if not title:
+            continue
+
+        raw_status = item.get("status") or "pending"
+        status = str(raw_status)
+        summary = normalize_subtask_summary(item.get("summary"))
+        if summary is None and shared_summary and status.lower() in ("in_progress", "in-progress", "inprogress", "running", "active"):
+            summary = shared_summary
+
+        normalized.append({
+            "id": str(item.get("id") or index + 1),
+            "kind": "plan",
+            "status": status,
+            "title": title,
+            "summary": summary,
+            "started_at": None,
+            "completed_at": None,
+        })
+
+    return normalized if normalized else None
+
+
+def parse_json_object(value):
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return None
+
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    return parsed if isinstance(parsed, dict) else None
+
+
+def extract_latest_update_plan_payload(entries, start_index=0):
+    latest_plan_payload = None
+
+    for entry in entries[start_index:]:
+        entry_type = entry.get("type")
+        payload = entry.get("payload")
+        if not isinstance(payload, dict):
+            continue
+
+        if entry_type == "response_item":
+            if payload.get("type") == "function_call" and payload.get("name") == "update_plan":
+                arguments = parse_json_object(payload.get("arguments"))
+                if arguments:
+                    latest_plan_payload = arguments
+
+        if entry_type == "event_msg" and payload.get("type") == "update_plan":
+            plan_data = payload.get("plan") or payload.get("data")
+            if isinstance(plan_data, dict):
+                latest_plan_payload = plan_data
+            elif isinstance(plan_data, list):
+                latest_plan_payload = {"plan": plan_data}
+
+    return latest_plan_payload
+
+
+def extract_codex_transcript_subtasks(stdin_data):
+    transcript_path = normalized_transcript_path(stdin_data)
+    if not transcript_path or not os.path.isfile(transcript_path):
+        return None
+
+    lines = read_tail_lines(transcript_path, TRANSCRIPT_TAIL_BYTES, TRANSCRIPT_TAIL_LINES)
+    if not lines:
+        return None
+
+    entries = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    if not entries:
+        return None
+
+    current_turn_start = 0
+    for index, entry in enumerate(entries):
+        if entry.get("type") != "event_msg":
+            continue
+
+        payload = entry.get("payload")
+        if not isinstance(payload, dict):
+            continue
+
+        if payload.get("type") in ("task_started", "user_message"):
+            current_turn_start = index
+
+    latest_plan_payload = extract_latest_update_plan_payload(entries, start_index=current_turn_start)
+    if latest_plan_payload is None and current_turn_start > 0:
+        latest_plan_payload = extract_latest_update_plan_payload(entries)
+
+    return normalize_plan_subtasks(latest_plan_payload)
+
+
+# ---------------------------------------------------------------------------
+# Source-specific subtask extractors
+# ---------------------------------------------------------------------------
+# Each agent may provide plan/todo/subagent data in different ways.
+# The extraction priority is: direct tool payload > current-turn transcript > legacy fallback.
+# ---------------------------------------------------------------------------
+
+
+def extract_codebuddy_subtasks(stdin_data):
+    """Extract subtasks for CodeBuddy source.
+
+    Priority:
+    1. task tool call (PreToolUse) → infer SubagentStart
+    2. SubagentStop event → mark subagent completed
+    3. Direct update_plan from current hook tool_input
+    4. Current-turn transcript update_plan
+    5. Legacy transcript turn fallback
+    """
+    hook_type = get_hook_type(stdin_data)
+    tool_name = (stdin_data.get("tool_name") or stdin_data.get("toolName") or "").lower()
+
+    # A. Infer SubagentStart from task tool call on PreToolUse
+    if tool_name == "task" and hook_type == "PreToolUse":
+        tool_input = parse_json_object(stdin_data.get("tool_input") or stdin_data.get("toolInput") or {})
+        if isinstance(tool_input, dict):
+            description = (tool_input.get("description") or tool_input.get("prompt")
+                          or tool_input.get("title") or tool_input.get("message"))
+            if description:
+                return [{
+                    "id": extract_tool_use_id(stdin_data) or f"task-{time.time()}",
+                    "kind": "subagent",
+                    "status": "in_progress",
+                    "title": normalize_subtask_title(description),
+                    "summary": None,
+                    "started_at": time.time(),
+                    "completed_at": None,
+                }]
+
+    # B. SubagentStop event → mark subagent completed
+    if hook_type == "SubagentStop":
+        message = stdin_data.get("message") or stdin_data.get("last_assistant_message")
+        return [{
+            "id": extract_tool_use_id(stdin_data) or f"subagent-stop-{time.time()}",
+            "kind": "subagent",
+            "status": "completed",
+            "title": normalize_subtask_title(message or "Subagent completed"),
+            "summary": normalize_subtask_summary(message),
+            "started_at": None,
+            "completed_at": time.time(),
+        }]
+
+    # C. Direct Tool Payload — update_plan in current hook event
+    if tool_name in ("update_plan", "updateplan"):
+        tool_input = parse_json_object(stdin_data.get("tool_input") or stdin_data.get("toolInput") or {})
+        direct_subtasks = normalize_plan_subtasks(tool_input)
+        if direct_subtasks:
+            return direct_subtasks
+
+    # D. Current-Turn Transcript Fallback
+    transcript_subtasks = extract_codebuddy_transcript_subtasks(stdin_data)
+    if transcript_subtasks:
+        return transcript_subtasks
+
+    # E. Legacy Transcript Turn Fallback (only as last resort)
+    return extract_codex_transcript_subtasks(stdin_data)
+
+
+def extract_codex_subtasks(stdin_data):
+    """Extract subtasks for Codex source.
+
+    Priority:
+    1. Direct update_plan from current hook tool_input
+    2. Current-turn transcript update_plan
+    3. Transcript turn-based fallback
+    """
+    # A. Direct Tool Payload
+    tool_name = (stdin_data.get("tool_name") or stdin_data.get("toolName") or "").lower()
+    if tool_name in ("update_plan", "updateplan"):
+        tool_input = parse_json_object(stdin_data.get("tool_input") or stdin_data.get("toolInput") or {})
+        direct_subtasks = normalize_plan_subtasks(tool_input)
+        if direct_subtasks:
+            return direct_subtasks
+
+    # B. Current-turn transcript fallback
+    transcript_subtasks = extract_codex_transcript_subtasks(stdin_data)
+    if transcript_subtasks:
+        return transcript_subtasks
+
+    return None
+
+
+def extract_claude_hook_subtasks(stdin_data):
+    hook_type = get_hook_type(stdin_data)
+    if hook_type not in ("SubagentStart", "SubagentStop"):
+        return None
+
+    agent_id = stdin_data.get("agent_id")
+    agent_type = stdin_data.get("agent_type") or "Subagent"
+    now = time.time()
+    summary = None
+    status = "in_progress"
+    completed_at = None
+
+    if hook_type == "SubagentStop":
+        status = "completed"
+        completed_at = now
+        summary = normalize_subtask_summary(
+            stdin_data.get("last_assistant_message")
+            or stdin_data.get("message")
+        )
+
+    title = normalize_subtask_title(f"{agent_type} subagent") or "Subagent"
+    return [{
+        "id": str(agent_id or f"claude-subagent-{agent_type}"),
+        "kind": "subagent",
+        "status": status,
+        "title": title,
+        "summary": summary,
+        "started_at": None if hook_type == "SubagentStop" else now,
+        "completed_at": completed_at,
+    }]
+
+
+def extract_claude_subtasks(stdin_data):
+    """Extract subtasks for Claude Code source.
+
+    Priority:
+    1. Native SubagentStart/SubagentStop lifecycle hooks
+    2. Transcript-based update_plan fallback
+    """
+    hook_subtasks = extract_claude_hook_subtasks(stdin_data)
+    if hook_subtasks:
+        return hook_subtasks
+
+    return extract_codex_transcript_subtasks(stdin_data)
+
+
+def extract_codebuddy_transcript_subtasks(stdin_data):
+    """Extract update_plan from CodeBuddy transcript, scoped to current turn only.
+
+    CodeBuddy transcripts may store update_plan as function_call entries.
+    This function searches backwards from the most recent user_message boundary
+    to find the latest update_plan call.
+    """
+    transcript_path = normalized_transcript_path(stdin_data)
+    if not transcript_path or not os.path.isfile(transcript_path):
+        return None
+
+    lines = read_tail_lines(transcript_path, TRANSCRIPT_TAIL_BYTES, TRANSCRIPT_TAIL_LINES)
+    if not lines:
+        return None
+
+    entries = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    if not entries:
+        return None
+
+    # Find current turn boundary: last user_message or task_started
+    current_turn_start = 0
+    for index, entry in enumerate(entries):
+        entry_type = entry.get("type")
+        payload = entry.get("payload")
+        if not isinstance(payload, dict):
+            continue
+
+        # Codex-style transcript
+        if entry_type == "event_msg" and payload.get("type") in ("task_started", "user_message"):
+            current_turn_start = index
+
+        # CodeBuddy-style transcript (role-based messages)
+        if entry_type == "response_item" and payload.get("role") == "user":
+            current_turn_start = index
+
+    # Search for the latest update_plan within the current turn
+    latest_plan_payload = extract_latest_update_plan_payload(entries, start_index=current_turn_start)
+    if latest_plan_payload is None and current_turn_start > 0:
+        latest_plan_payload = extract_latest_update_plan_payload(entries)
+
+    return normalize_plan_subtasks(latest_plan_payload)
+
+
+# Map source identifiers to their subtask extractors
+_SOURCE_SUBTASK_EXTRACTORS = {
+    "codebuddy": extract_codebuddy_subtasks,
+    "codex": extract_codex_subtasks,
+    "claude-code": extract_claude_subtasks,
+    "workbuddy": extract_codebuddy_subtasks,  # WorkBuddy shares CodeBuddy's hook format
+}
+
+
+def extract_subtasks(source, stdin_data):
+    """Extract normalized subtasks using source-specific adapter.
+
+    Falls back to CodeBuddy extractor for unknown sources.
+    """
+    extractor = _SOURCE_SUBTASK_EXTRACTORS.get(source, extract_codebuddy_subtasks)
+    return extractor(stdin_data)
+
+
+def extract_todo_items(stdin_data):
+    """Extract todo_write items as normalized [{id, status, content}] list."""
+    tool_name = (stdin_data.get("tool_name") or stdin_data.get("toolName") or "").lower()
+    if tool_name not in ("todo_write", "todowrite"):
+        return None
+
+    tool_input = stdin_data.get("tool_input") or stdin_data.get("toolInput") or {}
+
+    # Some agents may pass tool_input as a JSON string.
+    if isinstance(tool_input, str):
+        try:
+            tool_input = json.loads(tool_input)
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    if not isinstance(tool_input, dict):
+        return None
+
+    todos_raw = tool_input.get("todos")
+    if todos_raw is None:
+        return None
+
+    if isinstance(todos_raw, str):
+        try:
+            todos = json.loads(todos_raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    elif isinstance(todos_raw, list):
+        todos = todos_raw
+    else:
+        return None
+
+    normalized = []
+    for t in todos:
+        if not isinstance(t, dict):
+            continue
+        todo_id = t.get("id")
+        status = t.get("status")
+        content = t.get("content")
+        if todo_id is None or status is None or content is None:
+            continue
+        normalized.append({
+            "id": str(todo_id),
+            "status": str(status),
+            "content": str(content),
+        })
+
+    return normalized if normalized else None
+
+
+def build_event(source, stdin_data):
+    """Build the event payload to send to Vland."""
+    hook_type = get_hook_type(stdin_data)
+    transcript_path = normalized_transcript_path(stdin_data, source=source)
+
+    # Inject inferred transcript_path back into stdin_data so downstream
+    # functions (extract_latest_agent_message, etc.) can use it.
+    if transcript_path and not stdin_data.get("transcript_path") and not stdin_data.get("transcriptPath"):
+        stdin_data["transcript_path"] = transcript_path
+
+    tool_input_summary, extracted_file_path = extract_tool_input_summary(stdin_data)
+    file_path = (stdin_data.get("file_path") or stdin_data.get("filePath")
+                 or extracted_file_path)
+
+    # Use 'cwd' as project if no explicit project field
+    project = (stdin_data.get("project")
+               or stdin_data.get("cwd")
+               or os.environ.get("CODEBUDDY_PROJECT_DIR")
+               or os.environ.get("CODEX_PROJECT_DIR")
+               or os.environ.get("CLAUDE_PROJECT_DIR")
+               or os.environ.get("WORKBUDDY_PROJECT_DIR")
+               or os.getcwd())
+
+    # Session ID from stdin or environment
+    session_id = extract_session_id(stdin_data)
+
+    event = {
+        "source": source,
+        "hook_type": hook_type,
+        "timestamp": time.time(),
+        "session_id": session_id,
+        "pid": extract_process_id(stdin_data),
+        "tty": extract_terminal_tty(),
+        "tool_name": stdin_data.get("tool_name") or stdin_data.get("toolName"),
+        "tool_input": tool_input_summary,
+        "file_path": file_path,
+        "project": project,
+        "transcript_path": transcript_path,
+        "message": truncate(
+            stdin_data.get("message") or stdin_data.get("title"),
+            MAX_MESSAGE_LEN
+        ),
+        "user_prompt": extract_user_prompt(stdin_data),
+        "agent_output": extract_agent_output(stdin_data),
+        "tool_output": extract_tool_response(stdin_data),
+        "todo_items": extract_todo_items(stdin_data),
+        "subtasks": extract_subtasks(source, stdin_data),
+        "interaction": extract_interaction(source, stdin_data),
+        "tool_use_id": extract_tool_use_id(stdin_data),
+        "agent_id": extract_string_field(stdin_data, "agent_id", "agentId"),
+        "parent_tool_id": extract_string_field(stdin_data, "parent_tool_id", "parentToolId"),
+        "raw_hook_type": extract_string_field(
+            stdin_data,
+            "hook_event_name",
+            "hookEventName",
+            "hook_type",
+            "hookType",
+            "event",
+        ),
+        # Context tracking fields
+        "context_window": extract_int_field(stdin_data, "context_window", "contextWindow"),
+        "context_used": extract_int_field(stdin_data, "context_used", "contextUsed"),
+        "model": extract_string_field(stdin_data, "model", "modelName"),
+    }
+    event["needs_response"] = needs_bridge_response(event)
+
+    return event
+
+
+def send_event(event):
+    """Send event to Vland via Unix Domain Socket."""
+    if not os.path.exists(SOCKET_PATH):
+        return
+
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(2.0)
+        sock.connect(SOCKET_PATH)
+        payload = json.dumps(event, ensure_ascii=False) + "\n"
+        sock.sendall(payload.encode("utf-8"))
+        sock.close()
+    except (socket.error, OSError):
+        pass
+
+
+def needs_bridge_response(event):
+    """Determine whether this event should keep the socket open for a reply."""
+    interaction = event.get("interaction")
+    if not isinstance(interaction, dict):
+        return False
+
+    if interaction.get("bridgeResponseKind"):
+        return True
+
+    response_mode = interaction.get("responseMode") or interaction.get("response_mode")
+    if not isinstance(response_mode, str):
+        return False
+
+    return response_mode.lower() == "approval_selection"
+
+
+def send_event_and_wait(event, timeout=BRIDGE_RESPONSE_TIMEOUT):
+    """Send event to Vland and wait for a single JSON response line."""
+    if not os.path.exists(SOCKET_PATH):
+        return None
+
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect(SOCKET_PATH)
+
+        payload = json.dumps(event, ensure_ascii=False) + "\n"
+        sock.sendall(payload.encode("utf-8"))
+
+        response_data = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response_data += chunk
+            if b"\n" in response_data:
+                break
+
+        sock.close()
+
+        if not response_data:
+            return None
+
+        line = response_data.split(b"\n", 1)[0].decode("utf-8").strip()
+        if not line:
+            return None
+
+        return json.loads(line)
+    except (socket.error, OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Vland AI Agent Bridge")
+    parser.add_argument("--source", default="codebuddy",
+                        help="AI agent source identifier")
+    args = parser.parse_args()
+
+    stdin_data = parse_stdin()
+    event = build_event(args.source, stdin_data)
+    if event.get("needs_response") is True:
+        response = send_event_and_wait(event)
+        if response is not None:
+            print(json.dumps(response, ensure_ascii=False))
+            sys.stdout.flush()
+        else:
+            # Vland did not respond (timeout / not connected)
+            # Safety fallback: exit code 2 blocks the tool execution for approval scenarios
+            interaction = event.get("interaction") or {}
+            response_mode = interaction.get("responseMode") or interaction.get("response_mode")
+            if isinstance(response_mode, str) and response_mode.lower() == "approval_selection":
+                sys.exit(2)
+    else:
+        send_event(event)
+    maybe_send_agent_response_event(args.source, stdin_data, event)
+
+    # Avoid state-file buildup after a session ends.
+    if event.get("hook_type") in ("Stop", "SessionEnd"):
+        clear_stream_state(stream_state_path(args.source, stdin_data))
+
+
+if __name__ == "__main__":
+    main()

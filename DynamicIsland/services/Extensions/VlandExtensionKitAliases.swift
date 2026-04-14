@@ -1,0 +1,23 @@
+import AtollExtensionKit
+
+let VlandExtensionKitVersion = AtollExtensionKitVersion
+
+typealias VlandColorDescriptor = AtollColorDescriptor
+typealias VlandFontDescriptor = AtollFontDescriptor
+typealias VlandFontDesign = AtollFontDesign
+typealias VlandFontWeight = AtollFontWeight
+typealias VlandIconDescriptor = AtollIconDescriptor
+typealias VlandLiveActivityDescriptor = AtollLiveActivityDescriptor
+typealias VlandLiveActivityPriority = AtollLiveActivityPriority
+typealias VlandLockScreenWidgetDescriptor = AtollLockScreenWidgetDescriptor
+typealias VlandNotchContentSection = AtollNotchContentSection
+typealias VlandNotchExperienceDescriptor = AtollNotchExperienceDescriptor
+typealias VlandProgressIndicator = AtollProgressIndicator
+typealias VlandSneakPeekConfig = AtollSneakPeekConfig
+typealias VlandTrailingContent = AtollTrailingContent
+typealias VlandWidgetAppearanceOptions = AtollWidgetAppearanceOptions
+typealias VlandWidgetContentElement = AtollWidgetContentElement
+typealias VlandWidgetPosition = AtollWidgetPosition
+typealias VlandWidgetWebContentDescriptor = AtollWidgetWebContentDescriptor
+typealias VlandXPCClientProtocol = AtollXPCClientProtocol
+typealias VlandXPCServiceProtocol = AtollXPCServiceProtocol
