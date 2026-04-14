@@ -57,7 +57,7 @@ struct ColorFormatter {
     }
 }
 
-class ColorPickerManager: ObservableObject {
+final class ColorPickerManager: ObservableObject {
     static let shared = ColorPickerManager()
     
     @Published var colorHistory: [PickedColor] = []

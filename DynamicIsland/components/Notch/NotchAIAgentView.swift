@@ -613,6 +613,12 @@ struct AIAgentSessionCard: View {
                 Task { await agentManager.loadFullTranscript(for: session) }
             }
         }
+        .onChange(of: session.lastAgentOutput) { _, _ in
+            // Reload transcript when agent output arrives (real-time update for detailed mode)
+            if chatDisplayMode == .detailed && session.agentType.supportsFullHistory {
+                Task { await agentManager.reloadFullTranscript(for: session) }
+            }
+        }
     }
 
     private var chatModeSwitch: some View {
@@ -1097,7 +1103,7 @@ struct InteractionView: View {
     }
 
     private func mapSubmissionState(
-        _ result: AIAgentManager.InteractionResponseResult,
+        _ result: InteractionResponseResult,
         option: String
     ) -> SubmissionState {
         switch result {

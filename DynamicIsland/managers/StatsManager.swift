@@ -373,7 +373,7 @@ struct DiskTotals: Equatable {
     static let zero = DiskTotals(readMB: 0, writtenMB: 0)
 }
 
-class StatsManager: ObservableObject {
+final class StatsManager: ObservableObject {
     // MARK: - Properties
     static let shared = StatsManager()
     

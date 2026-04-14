@@ -165,7 +165,7 @@ enum ClipboardItemType: String, CaseIterable, Codable {
     }
 }
 
-class ClipboardManager: ObservableObject {
+final class ClipboardManager: ObservableObject {
     static let shared = ClipboardManager()
     
     @Published var clipboardHistory: [ClipboardItem] = []

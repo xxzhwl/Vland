@@ -40,7 +40,7 @@ struct AIAgentSettings: View {
     }
 
     private var displayedAgents: [AIAgentManager.DetectedAgent] {
-        var agents = agentManager.detectedAgents
+        var agents = agentManager.hookConfig.detectedAgents
         let home = FileManager.default.homeDirectoryForCurrentUser.path
 
         if !agents.contains(where: { $0.id == "codex" }) {
@@ -155,13 +155,13 @@ struct AIAgentSettings: View {
                 Section {
                     // Bridge script status
                     HStack {
-                        Image(systemName: agentManager.bridgeInstalled ? "checkmark.circle.fill" : "xmark.circle.fill")
-                            .foregroundColor(agentManager.bridgeInstalled ? .green : .red)
+                        Image(systemName: agentManager.hookConfig.bridgeInstalled ? "checkmark.circle.fill" : "xmark.circle.fill")
+                            .foregroundColor(agentManager.hookConfig.bridgeInstalled ? .green : .red)
                             .font(.system(size: 14))
                         VStack(alignment: .leading, spacing: 1) {
                             Text("桥接脚本")
                                 .font(.system(size: 12, weight: .medium))
-                            Text(agentManager.bridgeInstalled ? "已安装于 ~/.vland/bin/vland-bridge" : "未安装")
+                            Text(agentManager.hookConfig.bridgeInstalled ? "已安装于 ~/.vland/bin/vland-bridge" : "未安装")
                                 .font(.system(size: 10))
                                 .foregroundStyle(.secondary)
                         }
@@ -215,10 +215,10 @@ struct AIAgentSettings: View {
                 }
 
                 // MARK: Configuration Log
-                if !agentManager.configurationLog.isEmpty {
+                if !agentManager.hookConfig.configurationLog.isEmpty {
                     Section {
                         VStack(alignment: .leading, spacing: 4) {
-                            ForEach(Array(agentManager.configurationLog.enumerated()), id: \.offset) { _, line in
+                            ForEach(Array(agentManager.hookConfig.configurationLog.enumerated()), id: \.offset) { _, line in
                                 Text(line)
                                     .font(.system(size: 10, design: .monospaced))
                                     .foregroundStyle(.secondary)

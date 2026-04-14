@@ -96,7 +96,7 @@ extension AppDelegate {
     }
 }
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     var windows: [NSScreen: NSWindow] = [:]
     var viewModels: [NSScreen: DynamicIslandViewModel] = [:]
@@ -127,6 +127,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     // Debouncing mechanism for window size updates
     private var windowSizeUpdateWorkItem: DispatchWorkItem?
+
+    // Notification tokens for closure-based observers (to enable proper cleanup)
+    private var notificationTokens: [NSObjectProtocol] = []
 //    let calendarManager = CalendarManager.shared
 //    let webcamManager = WebcamManager.shared
 //    var closeNotchWorkItem: DispatchWorkItem?
@@ -173,42 +176,46 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             "com.vox.vox",
             "com.coppertino.Vox",
         ]
-        
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didLaunchApplicationNotification,
-            object: nil,
-            queue: .main
-        ) { notification in
-            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                  let bundleID = app.bundleIdentifier,
-                  targetBundleIDs.contains(bundleID) else { return }
-            
-            // A target music app was launched, restart capture to include it
-            if Defaults[.enableRealTimeWaveform] {
-                print("🎵 [AudioTap] Music app launched: \(bundleID), restarting capture...")
-                // Give the app a moment to fully launch
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+
+        notificationTokens.append(
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didLaunchApplicationNotification,
+                object: nil,
+                queue: .main
+            ) { notification in
+                guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                      let bundleID = app.bundleIdentifier,
+                      targetBundleIDs.contains(bundleID) else { return }
+
+                // A target music app was launched, restart capture to include it
+                if Defaults[.enableRealTimeWaveform] {
+                    print("🎵 [AudioTap] Music app launched: \(bundleID), restarting capture...")
+                    // Give the app a moment to fully launch
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                        AudioTap.shared.restartCapture()
+                    }
+                }
+            }
+        )
+
+        // Also observe app terminations to restart capture
+        notificationTokens.append(
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didTerminateApplicationNotification,
+                object: nil,
+                queue: .main
+            ) { notification in
+                guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                      let bundleID = app.bundleIdentifier,
+                      targetBundleIDs.contains(bundleID) else { return }
+
+                // A target music app was terminated, restart capture to update the list
+                if Defaults[.enableRealTimeWaveform] {
+                    print("🎵 [AudioTap] Music app terminated: \(bundleID), restarting capture...")
                     AudioTap.shared.restartCapture()
                 }
             }
-        }
-        
-        // Also observe app terminations to restart capture
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didTerminateApplicationNotification,
-            object: nil,
-            queue: .main
-        ) { notification in
-            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                  let bundleID = app.bundleIdentifier,
-                  targetBundleIDs.contains(bundleID) else { return }
-            
-            // A target music app was terminated, restart capture to update the list
-            if Defaults[.enableRealTimeWaveform] {
-                print("🎵 [AudioTap] Music app terminated: \(bundleID), restarting capture...")
-                AudioTap.shared.restartCapture()
-            }
-        }
+        )
     }
     
     func applicationWillTerminate(_ notification: Notification) {
@@ -224,10 +231,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Cancel any pending window size updates
         windowSizeUpdateWorkItem?.cancel()
+
+        // Remove closure-based notification observers using stored tokens
+        notificationTokens.forEach { NotificationCenter.default.removeObserver($0) }
+        notificationTokens.removeAll()
+
+        // Remove target-action notification observers
         NotificationCenter.default.removeObserver(self)
+
+        // Remove DistributedNotificationCenter observers
+        DistributedNotificationCenter.default().removeObserver(self)
+
         extensionXPCServiceHost.stop()
         extensionRPCServer.stop()
-        
+
         // Stop AudioTap capture
         AudioTap.shared.stopCapture()
 
@@ -728,44 +745,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil
         )
 
-        NotificationCenter.default.addObserver(
-            forName: Notification.Name.selectedScreenChanged, object: nil, queue: nil
-        ) { [weak self] _ in
-            self?.adjustWindowPosition(changeAlpha: true)
-        }
-
-        NotificationCenter.default.addObserver(
-            forName: Notification.Name.notchHeightChanged, object: nil, queue: nil
-        ) { [weak self] _ in
-            self?.adjustWindowPosition()
-        }
-
-        NotificationCenter.default.addObserver(
-            forName: Notification.Name.automaticallySwitchDisplayChanged, object: nil, queue: nil
-        ) { [weak self] _ in
-            guard let self = self, let window = self.window else { return }
-            DispatchQueue.main.async {
-                window.alphaValue =
-                    self.coordinator.selectedScreen == self.coordinator.preferredScreen ? 1 : 0
+        notificationTokens.append(
+            NotificationCenter.default.addObserver(
+                forName: Notification.Name.selectedScreenChanged, object: nil, queue: nil
+            ) { [weak self] _ in
+                self?.adjustWindowPosition(changeAlpha: true)
             }
-        }
+        )
 
-        NotificationCenter.default.addObserver(
-            forName: Notification.Name.showOnAllDisplaysChanged, object: nil, queue: nil
-        ) { [weak self] _ in
-            guard let self = self else { return }
-            self.cleanupWindows(shouldInvert: true)
-
-            if !Defaults[.showOnAllDisplays] {
-                let viewModel = self.vm
-                let window = self.createDynamicIslandWindow(
-                    for: NSScreen.main ?? NSScreen.screens.first!, with: viewModel)
-                self.window = window
-                self.adjustWindowPosition(changeAlpha: true)
-            } else {
-                self.adjustWindowPosition()
+        notificationTokens.append(
+            NotificationCenter.default.addObserver(
+                forName: Notification.Name.notchHeightChanged, object: nil, queue: nil
+            ) { [weak self] _ in
+                self?.adjustWindowPosition()
             }
-        }
+        )
+
+        notificationTokens.append(
+            NotificationCenter.default.addObserver(
+                forName: Notification.Name.automaticallySwitchDisplayChanged, object: nil, queue: nil
+            ) { [weak self] _ in
+                guard let self = self, let window = self.window else { return }
+                DispatchQueue.main.async {
+                    window.alphaValue =
+                        self.coordinator.selectedScreen == self.coordinator.preferredScreen ? 1 : 0
+                }
+            }
+        )
+
+        notificationTokens.append(
+            NotificationCenter.default.addObserver(
+                forName: Notification.Name.showOnAllDisplaysChanged, object: nil, queue: nil
+            ) { [weak self] _ in
+                guard let self = self else { return }
+                self.cleanupWindows(shouldInvert: true)
+
+                if !Defaults[.showOnAllDisplays] {
+                    let viewModel = self.vm
+                    let window = self.createDynamicIslandWindow(
+                        for: NSScreen.main ?? NSScreen.screens.first!, with: viewModel)
+                    self.window = window
+                    self.adjustWindowPosition(changeAlpha: true)
+                } else {
+                    self.adjustWindowPosition()
+                }
+            }
+        )
 
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(onScreenLocked(_:)),

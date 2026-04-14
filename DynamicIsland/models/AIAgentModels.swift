@@ -590,6 +590,23 @@ struct AIAgentInteraction: Identifiable {
     }
 }
 
+// MARK: - Interaction Response Result
+
+/// Result of an interaction response submission
+enum InteractionResponseResult: Equatable {
+    case submitted(String)
+    case copiedForManualSend(String)
+    case requiresAccessibility(String)
+    case failed(String)
+
+    var shouldScheduleEndedRemoval: Bool {
+        switch self {
+        case .submitted: return true
+        case .copiedForManualSend, .requiresAccessibility, .failed: return false
+        }
+    }
+}
+
 // MARK: - Tool Call Record
 
 struct AIAgentToolCall: Identifiable {

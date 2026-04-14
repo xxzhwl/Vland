@@ -29,15 +29,8 @@ import SwiftUI
 /// Bridge scripts (installed into CodeBuddy/Codex/Claude Code hooks) send JSON events
 /// over the socket. This manager parses them and updates observable state for the UI.
 @MainActor
-class AIAgentManager: ObservableObject {
+final class AIAgentManager: ObservableObject {
     static let shared = AIAgentManager()
-
-    enum InteractionResponseResult: Equatable {
-        case submitted(String)
-        case copiedForManualSend(String)
-        case requiresAccessibility(String)
-        case failed(String)
-    }
 
     /// All active agent sessions, keyed by source identifier
     @Published var sessions: [String: AIAgentSession] = [:]
@@ -64,8 +57,12 @@ class AIAgentManager: ObservableObject {
     private let socketServer = AIAgentSocketServer(socketPath: AIAgentManager.socketPath)
     private let transcriptReconciler = AIAgentTranscriptReconciler()
     private lazy var transcriptWatcher = AIAgentTranscriptWatcher(reconciler: transcriptReconciler)
+    private let hookConfigurator = AIAgentHookConfigurator()
+    private let appActivator = AIAgentAppActivator()
+    private lazy var notificationCoordinator = AIAgentNotificationCoordinator(appActivator: appActivator)
     private var cancellables = Set<AnyCancellable>()
     private var staleSessionTimer: Timer?
+    private var pendingSessionRemovalItems: [String: DispatchWorkItem] = [:]
     private let minimumActiveSessionVisibilityTimeout: TimeInterval = 45
     private var presentedInteractionKeys = Set<String>()
     private var pendingBridgeResponsesByInteractionID: [UUID: PendingBridgeResponse] = [:]
@@ -187,28 +184,76 @@ class AIAgentManager: ObservableObject {
         return max(minimumActiveSessionVisibilityTimeout, cleanupThreshold)
     }
 
-    private struct TerminalAppCandidate {
-        let bundleIdentifier: String
-        let processName: String
+    // MARK: - App Activation (forwarded to AIAgentAppActivator)
+
+    func activateAgentApp(session: AIAgentSession) {
+        appActivator.activateAgentApp(session: session)
     }
 
-    private enum NotificationContext {
-        case sessionStart
-        case promptSubmitted
-        case taskProgress
-        case waitingInput
-        case interactionTimeout
-        case lifecycleSound
+    func activateAgentApp(agentType: AIAgentType) {
+        appActivator.activateAgentApp(agentType: agentType)
     }
 
-    private let terminalAppCandidates: [TerminalAppCandidate] = [
-        TerminalAppCandidate(bundleIdentifier: "com.apple.Terminal", processName: "Terminal"),
-        TerminalAppCandidate(bundleIdentifier: "com.googlecode.iterm2", processName: "iTerm2"),
-        TerminalAppCandidate(bundleIdentifier: "dev.morishitter.alacritty", processName: "Alacritty"),
-        TerminalAppCandidate(bundleIdentifier: "io.alacritty", processName: "Alacritty"),
-        TerminalAppCandidate(bundleIdentifier: "com.github.wez.wezterm", processName: "WezTerm"),
-        TerminalAppCandidate(bundleIdentifier: "com.mitchellh.ghostty", processName: "Ghostty"),
-    ]
+    private func activateGUIAgent(bundleIdentifiers: [String], applicationNames: [String]) {
+        appActivator.activateGUIAgent(bundleIdentifiers: bundleIdentifiers, applicationNames: applicationNames)
+    }
+
+    private func activateTerminalAgent() {
+        appActivator.activateTerminalAgent()
+    }
+
+    private func activateRunningApplication(_ app: NSRunningApplication) {
+        appActivator.activateRunningApplication(app)
+    }
+
+    private func resolvedGUIApplicationURL(bundleIdentifiers: [String], applicationNames: [String]) -> URL? {
+        // This is internal, exposed via prepareApplicationForInteractionResponse
+        nil
+    }
+
+    private func openApplication(at appURL: URL, fallbackBundleIdentifiers: [String]) {
+        // Used internally by appActivator
+    }
+
+    private func runningTerminalApplication() -> NSRunningApplication? {
+        // Used internally by appActivator
+        nil
+    }
+
+    private func runningGUIApplication(bundleIdentifiers: [String]) -> NSRunningApplication? {
+        // Used internally by appActivator
+        nil
+    }
+
+    private func prepareApplicationForInteractionResponse(session: AIAgentSession) async -> NSRunningApplication? {
+        await appActivator.prepareApplicationForInteractionResponse(session: session)
+    }
+
+    private func waitForRunningGUIApplication(bundleIdentifiers: [String], timeout: TimeInterval) async -> NSRunningApplication? {
+        await appActivator.waitForRunningGUIApplication(bundleIdentifiers: bundleIdentifiers, timeout: timeout)
+    }
+
+    private func sendPasteAndSubmit(to application: NSRunningApplication) async -> Bool {
+        await appActivator.sendPasteAndSubmit(to: application)
+    }
+
+    private func selectApprovalOption(at index: Int, to application: NSRunningApplication) async -> Bool {
+        await appActivator.selectApprovalOption(at: index, to: application)
+    }
+
+    private func postKeyStroke(_ keyCode: CGKeyCode, flags: CGEventFlags, to pid: pid_t) -> Bool {
+        appActivator.postKeyStroke(keyCode, flags: flags, to: pid)
+    }
+
+    private func activateTerminalApp() {
+        appActivator.activateTerminalApp()
+    }
+
+    private func isUserLikelyViewingSession(_ session: AIAgentSession) -> Bool {
+        appActivator.isUserLikelyViewingSession(session)
+    }
+
+    // MARK: - Session Comparison (forwarded - Phase 6)
 
     private func compareExpandedSessions(_ lhs: AIAgentSession, _ rhs: AIAgentSession) -> Bool {
         compareSessions(lhs, rhs, using: \.expandedSortAnchor)
@@ -240,44 +285,6 @@ class AIAgentManager: ObservableObject {
         }
 
         return lhs.startTime > rhs.startTime
-    }
-
-    private func isUserLikelyViewingSession(_ session: AIAgentSession) -> Bool {
-        if NSApp.isActive {
-            return true
-        }
-
-        guard let bundleIdentifier = NSWorkspace.shared.frontmostApplication?.bundleIdentifier else {
-            return false
-        }
-
-        if session.isCLIBacked {
-            return terminalAppCandidates.contains { $0.bundleIdentifier == bundleIdentifier }
-        }
-
-        return session.agentType.bundleIdentifiers.contains(bundleIdentifier)
-    }
-
-    private func shouldNotify(for session: AIAgentSession, context _: NotificationContext) -> Bool {
-        !isUserLikelyViewingSession(session)
-    }
-
-    private func markNotificationEmitted(for session: AIAgentSession, at date: Date = .now) {
-        session.lastNotificationAt = date
-    }
-
-    // MARK: - Activate Agent App
-
-    func activateAgentApp(session: AIAgentSession) {
-        if !session.agentType.bundleIdentifiers.isEmpty {
-            activateGUIAgent(
-                bundleIdentifiers: session.agentType.bundleIdentifiers,
-                applicationNames: session.agentType.applicationNames
-            )
-            return
-        }
-
-        activateTerminalAgent()
     }
 
     func submitInteractionResponse(
@@ -317,7 +324,7 @@ class AIAgentManager: ObservableObject {
             activateAgentApp(session: session)
 
             let result = InteractionResponseResult.requiresAccessibility(response)
-            triggerInteractionSelectionSneakPeek(session: session, option: response, interaction: interaction, result: result)
+            notificationCoordinator.notifyInteractionResult(session: session, interaction: interaction, result: result, option: response)
             return result
         }
 
@@ -325,7 +332,7 @@ class AIAgentManager: ObservableObject {
             activateAgentApp(session: session)
 
             let result = InteractionResponseResult.copiedForManualSend(response)
-            triggerInteractionSelectionSneakPeek(session: session, option: response, interaction: interaction, result: result)
+            notificationCoordinator.notifyInteractionResult(session: session, interaction: interaction, result: result, option: response)
             return result
         }
 
@@ -344,7 +351,7 @@ class AIAgentManager: ObservableObject {
             restorePasteboard(snapshot, ifChangeCountIs: authoredChangeCount)
         }
 
-        triggerInteractionSelectionSneakPeek(session: session, option: response, interaction: interaction, result: result)
+        notificationCoordinator.notifyInteractionResult(session: session, interaction: interaction, result: result, option: response)
         return result
     }
 
@@ -357,7 +364,7 @@ class AIAgentManager: ObservableObject {
         interaction: AIAgentInteraction,
         option: String
     ) async -> InteractionResponseResult {
-        guard let payload = bridgeResponsePayload(for: interaction, option: option) else {
+        guard let payload = AIAgentBridgeProtocol.responsePayload(for: interaction, option: option) else {
             let result = InteractionResponseResult.failed("Unsupported interaction response.")
             session.resolveInteraction(
                 id: interaction.id,
@@ -365,7 +372,7 @@ class AIAgentManager: ObservableObject {
                 taskOverride: "Failed to submit interaction",
                 statusOverride: .error
             )
-            triggerInteractionSelectionSneakPeek(session: session, option: option, interaction: interaction, result: result)
+            notificationCoordinator.notifyInteractionResult(session: session, interaction: interaction, result: result, option: option)
             return result
         }
 
@@ -378,7 +385,7 @@ class AIAgentManager: ObservableObject {
                 taskOverride: "Approval request expired.",
                 statusOverride: .error
             )
-            triggerInteractionSelectionSneakPeek(session: session, option: option, interaction: interaction, result: result)
+            notificationCoordinator.notifyInteractionResult(session: session, interaction: interaction, result: result, option: option)
             return result
         }
 
@@ -392,135 +399,8 @@ class AIAgentManager: ObservableObject {
         )
 
         let result = InteractionResponseResult.submitted(option)
-        triggerInteractionSelectionSneakPeek(session: session, option: option, interaction: interaction, result: result)
+        notificationCoordinator.notifyInteractionResult(session: session, interaction: interaction, result: result, option: option)
         return result
-    }
-
-    private func bridgeResponsePayload(
-        for interaction: AIAgentInteraction,
-        option: String
-    ) -> [String: Any]? {
-        if let payload = bridgeSpecificResponsePayload(for: interaction, option: option) {
-            return payload
-        }
-
-        switch interaction.responseMode {
-        case .approvalSelection:
-            if option.caseInsensitiveCompare("Allow") == .orderedSame
-                || option.caseInsensitiveCompare("Yes") == .orderedSame {
-                return ["decision": "allow"]
-            }
-
-            return [
-                "decision": "block",
-                "reason": "User rejected from Vland",
-            ]
-
-        case .pasteReply:
-            return [
-                "decision": "allow",
-                "selected": [option],
-            ]
-        }
-    }
-
-    private func bridgeSpecificResponsePayload(
-        for interaction: AIAgentInteraction,
-        option: String
-    ) -> [String: Any]? {
-        guard let kind = interaction.bridgeResponseKind else { return nil }
-
-        switch kind {
-        case "claude_permission_request":
-            if option.caseInsensitiveCompare("Allow") == .orderedSame
-                || option.caseInsensitiveCompare("Yes") == .orderedSame {
-                return [
-                    "hookSpecificOutput": [
-                        "hookEventName": "PermissionRequest",
-                        "decision": [
-                            "behavior": "allow"
-                        ]
-                    ]
-                ]
-            }
-
-            return [
-                "hookSpecificOutput": [
-                    "hookEventName": "PermissionRequest",
-                    "decision": [
-                        "behavior": "deny",
-                        "message": "User rejected from Vland",
-                        "interrupt": false
-                    ]
-                ]
-            ]
-
-        case "claude_ask_user_question":
-            guard let context = bridgeResponseContext(from: interaction.bridgeResponseContext),
-                  var toolInput = context["tool_input"] as? [String: Any],
-                  let question = context["question"] as? String else {
-                return nil
-            }
-
-            var answers = toolInput["answers"] as? [String: String] ?? [:]
-            answers[question] = option
-            toolInput["answers"] = answers
-
-            return [
-                "hookSpecificOutput": [
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
-                    "updatedInput": toolInput
-                ]
-            ]
-
-        case "codebuddy_ask_user_question":
-            guard let context = bridgeResponseContext(from: interaction.bridgeResponseContext),
-                  var toolInput = context["tool_input"] as? [String: Any],
-                  let question = context["question"] as? String else {
-                return nil
-            }
-
-            var answers = toolInput["answers"] as? [String: String] ?? [:]
-            answers[question] = option
-            toolInput["answers"] = answers
-
-            return [
-                "hookSpecificOutput": [
-                    "permissionDecision": "allow",
-                    "modifiedInput": toolInput
-                ]
-            ]
-
-        case "codebuddy_approval":
-            // Use CodeBuddy native hookSpecificOutput protocol
-            if option.caseInsensitiveCompare("Allow") == .orderedSame
-                || option.caseInsensitiveCompare("Yes") == .orderedSame {
-                return [
-                    "hookSpecificOutput": [
-                        "permissionDecision": "allow"
-                    ]
-                ]
-            }
-            return [
-                "hookSpecificOutput": [
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": "User rejected from Vland"
-                ]
-            ]
-
-        default:
-            return nil
-        }
-    }
-
-    private func bridgeResponseContext(from rawValue: String?) -> [String: Any]? {
-        guard let rawValue,
-              let data = rawValue.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-        return json
     }
 
     private func writeBridgeResponse(
@@ -535,264 +415,21 @@ class AIAgentManager: ObservableObject {
         return await socketServer.sendResponse(payload, to: pending.connection)
     }
 
-    /// Activate (bring to front) the macOS application associated with the given agent type.
-    /// For CLI-based agents (claude-code, codex, gemini-cli), this attempts to activate the terminal
-    /// that is likely running the agent.
-    func activateAgentApp(agentType: AIAgentType) {
-        if !agentType.bundleIdentifiers.isEmpty {
-            activateGUIAgent(
-                bundleIdentifiers: agentType.bundleIdentifiers,
-                applicationNames: agentType.applicationNames
-            )
-            return
-        }
-
-        // CLI-based agents: try to activate the running terminal
-        activateTerminalApp()
-    }
-
-    private func activateGUIAgent(bundleIdentifiers: [String], applicationNames: [String]) {
-        if let appURL = resolvedGUIApplicationURL(
-            bundleIdentifiers: bundleIdentifiers,
-            applicationNames: applicationNames
-        ) {
-            openApplication(at: appURL, fallbackBundleIdentifiers: bundleIdentifiers)
-            return
-        }
-
-        if let bundleIdentifier = bundleIdentifiers.first {
-            lastError = "Failed to locate app for \(bundleIdentifier)"
-        } else if let applicationName = applicationNames.first {
-            lastError = "Failed to locate app for \(applicationName)"
-        }
-    }
-
-    private func activateTerminalAgent() {
-        for candidate in terminalAppCandidates {
-            guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: candidate.bundleIdentifier).first else {
-                continue
-            }
-
-            activateRunningApplication(app)
-            return
-        }
-
-        activateTerminalApp()
-    }
-
-    private func activateRunningApplication(_ app: NSRunningApplication) {
-        if NSApp.isActive {
-            NSApp.deactivate()
-        }
-
-        _ = app.unhide()
-        _ = app.activate(options: [.activateAllWindows])
-    }
-
-    private func resolvedGUIApplicationURL(
-        bundleIdentifiers: [String],
-        applicationNames: [String]
-    ) -> URL? {
-        let workspace = NSWorkspace.shared
-
-        if let runningApp = runningGUIApplication(bundleIdentifiers: bundleIdentifiers),
-           let bundleURL = runningApp.bundleURL {
-            return bundleURL
-        }
-
-        for bundleIdentifier in bundleIdentifiers {
-            if let appURL = workspace.urlForApplication(withBundleIdentifier: bundleIdentifier) {
-                return appURL
-            }
-        }
-
-        for applicationName in applicationNames {
-            if let appPath = workspace.fullPath(forApplication: applicationName) {
-                return URL(fileURLWithPath: appPath)
-            }
-        }
-
-        return nil
-    }
-
-    private func openApplication(at appURL: URL, fallbackBundleIdentifiers: [String]) {
-        let workspace = NSWorkspace.shared
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
-        configuration.addsToRecentItems = false
-        configuration.createsNewApplicationInstance = false
-
-        workspace.openApplication(at: appURL, configuration: configuration) { [weak self] app, error in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-
-                if let app {
-                    self.lastError = nil
-                    self.activateRunningApplication(app)
-                    return
-                }
-
-                if let runningApp = self.runningGUIApplication(bundleIdentifiers: fallbackBundleIdentifiers) {
-                    self.lastError = nil
-                    self.activateRunningApplication(runningApp)
-                    return
-                }
-
-                if let error {
-                    self.lastError = "Failed to open \(appURL.lastPathComponent): \(error.localizedDescription)"
-                } else {
-                    self.lastError = "Failed to open \(appURL.lastPathComponent)"
-                }
-            }
-        }
-    }
-
-    private func runningTerminalApplication() -> NSRunningApplication? {
-        for candidate in terminalAppCandidates {
-            if let app = NSRunningApplication.runningApplications(withBundleIdentifier: candidate.bundleIdentifier).first {
-                return app
-            }
-        }
-
-        return nil
-    }
-
-    private func runningGUIApplication(bundleIdentifiers: [String]) -> NSRunningApplication? {
-        for bundleIdentifier in bundleIdentifiers {
-            if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier).first {
-                return app
-            }
-        }
-
-        return nil
-    }
-
-    private func prepareApplicationForInteractionResponse(session: AIAgentSession) async -> NSRunningApplication? {
-        if !session.agentType.bundleIdentifiers.isEmpty {
-            if let runningApp = runningGUIApplication(bundleIdentifiers: session.agentType.bundleIdentifiers) {
-                activateRunningApplication(runningApp)
-                try? await Task.sleep(nanoseconds: 220_000_000)
-                return runningApp
-            }
-
-            guard resolvedGUIApplicationURL(
-                bundleIdentifiers: session.agentType.bundleIdentifiers,
-                applicationNames: session.agentType.applicationNames
-            ) != nil else {
-                return nil
-            }
-
-            activateGUIAgent(
-                bundleIdentifiers: session.agentType.bundleIdentifiers,
-                applicationNames: session.agentType.applicationNames
-            )
-            guard let launchedApp = await waitForRunningGUIApplication(bundleIdentifiers: session.agentType.bundleIdentifiers) else {
-                return nil
-            }
-
-            activateRunningApplication(launchedApp)
-            try? await Task.sleep(nanoseconds: 350_000_000)
-            return launchedApp
-        }
-
-        guard let terminalApp = runningTerminalApplication() else {
-            return nil
-        }
-
-        activateRunningApplication(terminalApp)
-        try? await Task.sleep(nanoseconds: 220_000_000)
-        return terminalApp
-    }
-
-    private func waitForRunningGUIApplication(
-        bundleIdentifiers: [String],
-        timeout: TimeInterval = 2.5
-    ) async -> NSRunningApplication? {
-        let startedAt = Date()
-        while Date().timeIntervalSince(startedAt) < timeout {
-            if let app = runningGUIApplication(bundleIdentifiers: bundleIdentifiers) {
-                return app
-            }
-            try? await Task.sleep(nanoseconds: 100_000_000)
-        }
-        return nil
-    }
-
-    private func sendPasteAndSubmit(to application: NSRunningApplication) async -> Bool {
-        let didPaste = postKeyStroke(CGKeyCode(kVK_ANSI_V), flags: .maskCommand, to: application.processIdentifier)
-        guard didPaste else { return false }
-
-        try? await Task.sleep(nanoseconds: 120_000_000)
-        return postKeyStroke(CGKeyCode(kVK_Return), to: application.processIdentifier)
-    }
-
-    private func selectApprovalOption(at index: Int, to application: NSRunningApplication) async -> Bool {
-        let pid = application.processIdentifier
-
-        for _ in 0..<8 {
-            guard postKeyStroke(CGKeyCode(kVK_UpArrow), to: pid) else { return false }
-            try? await Task.sleep(nanoseconds: 35_000_000)
-        }
-
-        if index > 0 {
-            for _ in 0..<index {
-                guard postKeyStroke(CGKeyCode(kVK_DownArrow), to: pid) else { return false }
-                try? await Task.sleep(nanoseconds: 35_000_000)
-            }
-        }
-
-        try? await Task.sleep(nanoseconds: 60_000_000)
-        return postKeyStroke(CGKeyCode(kVK_Return), to: pid)
-    }
-
-    private func postKeyStroke(
-        _ keyCode: CGKeyCode,
-        flags: CGEventFlags = [],
-        to pid: pid_t
-    ) -> Bool {
-        guard let source = CGEventSource(stateID: .hidSystemState),
-              let keyDown = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true),
-              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false) else {
-            return false
-        }
-
-        keyDown.flags = flags
-        keyUp.flags = flags
-        keyDown.postToPid(pid)
-        keyUp.postToPid(pid)
-        return true
-    }
-
     private func restorePasteboard(_ snapshot: PasteboardSnapshot, ifChangeCountIs expectedChangeCount: Int) {
         let pasteboard = NSPasteboard.general
         guard pasteboard.changeCount == expectedChangeCount else { return }
         snapshot.restore(to: pasteboard)
     }
 
-    /// Attempt to activate the terminal application that is likely running a CLI agent.
-    private func activateTerminalApp() {
-        let workspace = NSWorkspace.shared
-
-        // First, check if any of these terminals are already running
-        for candidate in terminalAppCandidates {
-            if let app = NSRunningApplication.runningApplications(withBundleIdentifier: candidate.bundleIdentifier).first {
-                activateRunningApplication(app)
-                return
-            }
-        }
-
-        // No terminal running — try to launch the default Terminal.app
-        if let appURL = workspace.urlForApplication(withBundleIdentifier: "com.apple.Terminal") {
-            let configuration = NSWorkspace.OpenConfiguration()
-            configuration.activates = true
-            workspace.openApplication(at: appURL, configuration: configuration)
-        }
-    }
-
     // MARK: - Lifecycle
 
     private init() {
         configureMonitoringPipeline()
+
+        // Wire up app activator error callback
+        appActivator.onError = { [weak self] error in
+            self?.lastError = error
+        }
 
         // Observe feature toggle
         Defaults.publisher(.enableAIAgentFeature)
@@ -852,6 +489,10 @@ class AIAgentManager: ObservableObject {
         pendingBridgeResponsesByInteractionID.removeAll()
         pendingBridgeResponseIDsByConnection.removeAll()
         pendingBridgeInteractionIDs.removeAll()
+        staleSessionTimer?.invalidate()
+        staleSessionTimer = nil
+        pendingSessionRemovalItems.values.forEach { $0.cancel() }
+        pendingSessionRemovalItems.removeAll()
     }
 
     // MARK: - Event Handling
@@ -878,18 +519,20 @@ class AIAgentManager: ObservableObject {
         }
 
         if shouldTriggerTaskPreview(for: event, session: session, hadVisibleTasks: result.hadVisibleTasks) {
-            triggerTodoSneakPeek(for: session)
+            notificationCoordinator.notifyTaskProgress(session: session)
         }
 
-        playSoundEffectIfNeeded(for: event, session: session)
+        notificationCoordinator.playSoundIfNeeded(for: event, session: session)
 
         // Trigger sneak peek notification for important events
-        if event.hookType == "SessionStart" || event.hookType == "UserPromptSubmit" {
-            triggerSneakPeek(for: session, event: event)
+        if event.hookType == "SessionStart" {
+            notificationCoordinator.notifySessionStart(session: session, event: event)
+        } else if event.hookType == "UserPromptSubmit" {
+            notificationCoordinator.notifyPromptSubmit(session: session, event: event)
         }
 
         if event.hookType == "SessionEnd" || event.hookType == "Stop" {
-            DynamicIslandViewCoordinator.shared.toggleSneakPeek(status: false, type: .aiAgent)
+            notificationCoordinator.notifySessionEnd()
         }
 
         sessionDidReceiveInteractionIfNeeded(session)
@@ -919,7 +562,7 @@ class AIAgentManager: ObservableObject {
         pendingBridgeInteractionIDs.insert(interaction.id)
 
         if interaction.responseMode == .approvalSelection {
-            triggerWaitingInputSneakPeek(for: session, interaction: interaction)
+            notificationCoordinator.notifyWaitingInput(session: session, interaction: interaction, isBridge: true)
         }
     }
 
@@ -947,7 +590,7 @@ class AIAgentManager: ObservableObject {
                 taskOverride: "Interaction timed out.",
                 statusOverride: .error
             )
-            triggerInteractionTimeoutSneakPeek(session: session, message: message)
+            notificationCoordinator.notifyInteractionTimeout(session: session, message: message)
             syncSessionsFromStore()
         }
     }
@@ -978,12 +621,12 @@ class AIAgentManager: ObservableObject {
         syncSessionsFromStore()
 
         if !hadVisibleTasks && sessionHasVisibleTaskState(session) {
-            triggerTodoSneakPeek(for: session)
+            notificationCoordinator.notifyTaskProgress(session: session)
         }
     }
 
     private func scheduleEndedSessionRemoval(sessionKey: String) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+        let item = DispatchWorkItem { [weak self] in
             guard let self,
                   let session = self.sessionStore.session(forKey: sessionKey),
                   !session.isArchived,
@@ -997,7 +640,10 @@ class AIAgentManager: ObservableObject {
                 self.selectedDetailSessionID = nil
             }
             self.syncSessionsFromStore()
+            self.pendingSessionRemovalItems.removeValue(forKey: sessionKey)
         }
+        pendingSessionRemovalItems[sessionKey] = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: item)
     }
 
     func presentSessionDetail(_ session: AIAgentSession) {
@@ -1045,120 +691,10 @@ class AIAgentManager: ObservableObject {
         let interactionKey = "\(session.id.uuidString)-\(interaction.timestamp.timeIntervalSince1970)-\(interaction.message)"
         guard !presentedInteractionKeys.contains(interactionKey) else { return }
         presentedInteractionKeys.insert(interactionKey)
-        guard shouldNotify(for: session, context: .waitingInput) else { return }
 
         latestInteractionPresentationID = UUID()
-        markNotificationEmitted(for: session)
         AIAgentSoundEffectManager.shared.play(.waitingInput)
-        triggerWaitingInputSneakPeek(for: session, interaction: interaction)
-    }
-
-    private func playSoundEffectIfNeeded(for event: AIAgentHookEvent, session: AIAgentSession) {
-        guard shouldNotify(for: session, context: .lifecycleSound) else { return }
-
-        switch event.hookType {
-        case "SessionStart":
-            AIAgentSoundEffectManager.shared.play(.sessionStart)
-        case "UserPromptSubmit":
-            AIAgentSoundEffectManager.shared.play(.promptSubmitted)
-        case "Stop", "SubagentStop":
-            AIAgentSoundEffectManager.shared.play(.completed)
-        default:
-            break
-        }
-    }
-
-    private func triggerSneakPeek(for session: AIAgentSession, event: AIAgentHookEvent) {
-        guard Defaults[.aiAgentShowSneakPeek],
-              shouldNotify(for: session, context: event.hookType == "SessionStart" ? .sessionStart : .promptSubmitted) else { return }
-
-        let agentType = session.agentType
-        let title = agentType.displayName
-        let subtitle: String
-        switch event.hookType {
-        case "SessionStart":
-            subtitle = "会话已启动"
-        case "UserPromptSubmit":
-            subtitle = event.message.map { String($0.prefix(50)) } ?? "新任务"
-        default:
-            subtitle = event.hookType
-        }
-
-        DynamicIslandViewCoordinator.shared.toggleSneakPeek(
-            status: true,
-            type: .aiAgent,
-            duration: 3.0,
-            icon: agentType.iconName,
-            title: title,
-            subtitle: subtitle,
-            accentColor: agentType.accentColor
-        )
-        markNotificationEmitted(for: session)
-    }
-
-    private func triggerTodoSneakPeek(for session: AIAgentSession) {
-        guard Defaults[.aiAgentShowSneakPeek],
-              shouldNotify(for: session, context: .taskProgress),
-              !session.todoItems.isEmpty || !session.displaySubtasks.isEmpty else { return }
-
-        DynamicIslandViewCoordinator.shared.toggleSneakPeek(
-            status: true,
-            type: .aiAgent,
-            duration: 30.0,
-            icon: session.agentType.iconName,
-            title: session.agentType.displayName,
-            subtitle: session.currentTodoDisplayText
-                ?? session.currentSubtaskDisplayText
-                ?? "正在执行任务...",
-            accentColor: session.agentType.accentColor,
-            styleOverride: .standard
-        )
-        markNotificationEmitted(for: session)
-    }
-
-    private func triggerWaitingInputSneakPeek(for session: AIAgentSession, interaction: AIAgentInteraction) {
-        guard Defaults[.aiAgentShowSneakPeek],
-              shouldNotify(for: session, context: .waitingInput) else { return }
-        let isApprovalRequest = interaction.isApprovalSelection
-        let isBridgeApproval = hasPendingBridgeResponse(for: interaction.id) && isApprovalRequest
-
-        if isApprovalRequest || session.todoItems.isEmpty {
-            DynamicIslandViewCoordinator.shared.toggleSneakPeek(
-                status: true,
-                type: .aiAgent,
-                duration: isBridgeApproval ? 4.5 : 4.0,
-                icon: isBridgeApproval ? "exclamationmark.triangle.fill" : session.agentType.iconName,
-                title: isApprovalRequest ? "需要审批" : "\(session.agentType.displayName) 需要输入",
-                subtitle: String(interaction.message.prefix(50)),
-                accentColor: isApprovalRequest ? .orange : session.agentType.accentColor
-            )
-        } else {
-            triggerTodoSneakPeek(for: session)
-        }
-
-        // Also show an expanding preview below the closed notch (like music playback preview),
-        // so users can see there's a task requiring attention even when the island is collapsed.
-        DynamicIslandViewCoordinator.shared.toggleExpandingView(
-            status: true,
-            type: .aiAgent
-        )
-        markNotificationEmitted(for: session)
-    }
-
-    private func triggerInteractionTimeoutSneakPeek(session: AIAgentSession, message: String) {
-        guard Defaults[.aiAgentShowSneakPeek],
-              shouldNotify(for: session, context: .interactionTimeout) else { return }
-
-        DynamicIslandViewCoordinator.shared.toggleSneakPeek(
-            status: true,
-            type: .aiAgent,
-            duration: 4.0,
-            icon: "exclamationmark.triangle.fill",
-            title: "交互超时",
-            subtitle: String(message.prefix(50)),
-            accentColor: .red
-        )
-        markNotificationEmitted(for: session)
+        notificationCoordinator.notifyWaitingInput(session: session, interaction: interaction, isBridge: false)
     }
 
     private func isTodoOrPlanTool(_ toolName: String?) -> Bool {
@@ -1195,65 +731,13 @@ class AIAgentManager: ObservableObject {
         return false
     }
 
-    private func triggerInteractionSelectionSneakPeek(
-        session: AIAgentSession,
-        option: String,
-        interaction: AIAgentInteraction,
-        result: InteractionResponseResult
-    ) {
-        let title: String
-        let subtitle: String
-        let accentColor: Color
-
-        switch result {
-        case .submitted:
-            if interaction.responseMode == .approvalSelection {
-                title = option.caseInsensitiveCompare("Allow") == .orderedSame ? "已批准" : "已阻止"
-                subtitle = String(interaction.message.prefix(50))
-                accentColor = option.caseInsensitiveCompare("Allow") == .orderedSame ? .green : .red
-            } else {
-                title = "已发送回复"
-                subtitle = String(option.prefix(50))
-                accentColor = session.agentType.accentColor
-            }
-            AIAgentSoundEffectManager.shared.play(.replySent)
-        case .copiedForManualSend:
-            title = interaction.responseMode == .approvalSelection ? "打开审批提示" : "已复制回复"
-            subtitle = interaction.responseMode == .approvalSelection
-                ? "选择: \(String(option.prefix(40)))"
-                : String(option.prefix(50))
-            accentColor = .orange
-            AIAgentSoundEffectManager.shared.play(.replyCopied)
-        case .requiresAccessibility:
-            title = "需要辅助功能权限"
-            subtitle = interaction.responseMode == .approvalSelection
-                ? "启用后可一键审批"
-                : "回复已复制，需手动提交"
-            accentColor = .orange
-            AIAgentSoundEffectManager.shared.play(.replyCopied)
-        case .failed(let message):
-            title = interaction.responseMode == .approvalSelection ? "审批失败" : "回复失败"
-            subtitle = String(message.prefix(50))
-            accentColor = .red
-            AIAgentSoundEffectManager.shared.play(.error)
-        }
-
-        if session.todoItems.isEmpty {
-            DynamicIslandViewCoordinator.shared.toggleSneakPeek(
-                status: true,
-                type: .aiAgent,
-                duration: 3.0,
-                icon: session.agentType.iconName,
-                title: title,
-                subtitle: subtitle,
-                accentColor: accentColor
-            )
-        } else {
-            triggerTodoSneakPeek(for: session)
-        }
-    }
-
     // MARK: - Full Transcript Loading
+
+    /// Reload full transcript for a session (forces reload even if already loaded).
+    func reloadFullTranscript(for session: AIAgentSession) async {
+        await MainActor.run { session.isTranscriptLoaded = false }
+        await loadFullTranscript(for: session)
+    }
 
     /// Load full transcript for a session (lazy, on-demand for detailed mode).
     func loadFullTranscript(for session: AIAgentSession) async {
@@ -1403,505 +887,18 @@ class AIAgentManager: ObservableObject {
         }
     }
 
-    // MARK: - Auto-Detection & Configuration
+    // MARK: - Hook Configuration (forwarded to AIAgentHookConfigurator)
 
-    /// Represents a detected AI agent tool installation
-    struct DetectedAgent: Identifiable {
-        let id: String         // e.g. "codebuddy", "claude-code"
-        let displayName: String
-        let settingsPath: String
-        let configDirExists: Bool
-        let settingsFileExists: Bool
-        var hookStatus: HookStatus
+    typealias DetectedAgent = AIAgentHookConfigurator.DetectedAgent
 
-        enum HookStatus: Equatable {
-            case notConfigured
-            case configuredVland
-            case configuredOther(String) // bridge path that is not vland's
-        }
-    }
+    /// Direct reference to hook configurator for Settings UI
+    var hookConfig: AIAgentHookConfigurator { hookConfigurator }
 
-    /// Published detection results for the Settings UI
-    @Published var detectedAgents: [DetectedAgent] = []
-    @Published var bridgeInstalled: Bool = false
-    @Published var configurationLog: [String] = []
+    static let bridgePath = AIAgentHookConfigurator.bridgePath
+    static var bundledBridgePath: String? { AIAgentHookConfigurator.bundledBridgePath }
 
-    /// The bridge script path that Vland uses
-    static let bridgePath: String = {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return (home as NSString).appendingPathComponent(".vland/bin/vland-bridge")
-    }()
-
-    /// Source bridge script bundled in app resources
-    static var bundledBridgePath: String? {
-        if let path = Bundle.main.path(forResource: "vland-bridge", ofType: nil, inDirectory: "bridge") {
-            return path
-        }
-        // Some build setups flatten resources without preserving subdirectories.
-        return Bundle.main.path(forResource: "vland-bridge", ofType: nil)
-    }
-
-    private struct HookTypeSpec {
-        let name: String
-        let matcher: String?
-        let timeoutSeconds: Int?
-    }
-
-    private struct AgentDefinition {
-        let id: String
-        let name: String
-        let configDir: String
-        let settingsFile: String
-        let hookTypes: [HookTypeSpec]
-        let requiresCodexHookFlag: Bool
-    }
-
-    /// Default hook set (used as base for CodeBuddy/WorkBuddy)
-    private static let defaultHookTypes: [HookTypeSpec] = [
-        HookTypeSpec(name: "PreToolUse", matcher: "*", timeoutSeconds: nil),
-        HookTypeSpec(name: "PostToolUse", matcher: "*", timeoutSeconds: nil),
-        HookTypeSpec(name: "SessionStart", matcher: nil, timeoutSeconds: nil),
-        HookTypeSpec(name: "SessionEnd", matcher: nil, timeoutSeconds: nil),
-        HookTypeSpec(name: "UserPromptSubmit", matcher: nil, timeoutSeconds: nil),
-        HookTypeSpec(name: "Stop", matcher: nil, timeoutSeconds: nil),
-        HookTypeSpec(name: "SubagentStop", matcher: nil, timeoutSeconds: nil),
-        HookTypeSpec(name: "Notification", matcher: "*", timeoutSeconds: nil),
-        HookTypeSpec(name: "PreCompact", matcher: nil, timeoutSeconds: nil),
-    ]
-
-    /// CodeBuddy / WorkBuddy hook set with pre-registered PermissionRequest and SubagentStart
-    private static let codebuddyHookTypes: [HookTypeSpec] = [
-        HookTypeSpec(name: "PreToolUse", matcher: "*", timeoutSeconds: nil),
-        HookTypeSpec(name: "PostToolUse", matcher: "*", timeoutSeconds: nil),
-        HookTypeSpec(name: "SessionStart", matcher: nil, timeoutSeconds: nil),
-        HookTypeSpec(name: "SessionEnd", matcher: nil, timeoutSeconds: nil),
-        HookTypeSpec(name: "UserPromptSubmit", matcher: nil, timeoutSeconds: nil),
-        HookTypeSpec(name: "Stop", matcher: nil, timeoutSeconds: nil),
-        HookTypeSpec(name: "SubagentStop", matcher: nil, timeoutSeconds: nil),
-        HookTypeSpec(name: "Notification", matcher: "*", timeoutSeconds: nil),
-        HookTypeSpec(name: "PreCompact", matcher: nil, timeoutSeconds: nil),
-        // Pre-registered for future support (no side effects until CodeBuddy emits these events)
-        HookTypeSpec(name: "PermissionRequest", matcher: "*", timeoutSeconds: 86_400),
-        HookTypeSpec(name: "SubagentStart", matcher: nil, timeoutSeconds: nil),
-    ]
-
-    /// Claude Code has dedicated approval and subagent lifecycle hooks.
-    private static let claudeHookTypes: [HookTypeSpec] = [
-        HookTypeSpec(name: "PreToolUse", matcher: "*", timeoutSeconds: nil),
-        HookTypeSpec(name: "PermissionRequest", matcher: "*", timeoutSeconds: 86_400),
-        HookTypeSpec(name: "PostToolUse", matcher: "*", timeoutSeconds: nil),
-        HookTypeSpec(name: "SessionStart", matcher: nil, timeoutSeconds: nil),
-        HookTypeSpec(name: "SessionEnd", matcher: nil, timeoutSeconds: nil),
-        HookTypeSpec(name: "UserPromptSubmit", matcher: nil, timeoutSeconds: nil),
-        HookTypeSpec(name: "Stop", matcher: nil, timeoutSeconds: nil),
-        HookTypeSpec(name: "SubagentStart", matcher: nil, timeoutSeconds: nil),
-        HookTypeSpec(name: "SubagentStop", matcher: nil, timeoutSeconds: nil),
-        HookTypeSpec(name: "Notification", matcher: "*", timeoutSeconds: nil),
-        HookTypeSpec(name: "PreCompact", matcher: nil, timeoutSeconds: nil),
-    ]
-
-    /// Codex currently uses a smaller hook event set.
-    private static let codexHookTypes: [HookTypeSpec] = [
-        HookTypeSpec(name: "PreToolUse", matcher: "*", timeoutSeconds: nil),
-        HookTypeSpec(name: "PostToolUse", matcher: "*", timeoutSeconds: nil),
-        HookTypeSpec(name: "SessionStart", matcher: "startup|resume", timeoutSeconds: nil),
-        HookTypeSpec(name: "UserPromptSubmit", matcher: nil, timeoutSeconds: nil),
-        HookTypeSpec(name: "Stop", matcher: nil, timeoutSeconds: nil),
-    ]
-
-    /// Agent configuration templates (id, name, defaultConfigDir, settingsFileName, hookTypes, requiresCodexHookFlag)
-    private static let agentTemplates: [(id: String, name: String, defaultConfigDir: String, settingsFileName: String, hookTypes: [HookTypeSpec], requiresCodexHookFlag: Bool)] = [
-        ("codebuddy", "CodeBuddy", ".codebuddy", "settings.json", codebuddyHookTypes, false),
-        ("codex", "Codex CLI", ".codex", "hooks.json", codexHookTypes, true),
-        ("claude-code", "Claude Code", ".claude", "settings.json", claudeHookTypes, false),
-        ("workbuddy", "WorkBuddy", ".workbuddy", "settings.json", codebuddyHookTypes, false),
-    ]
-
-    /// Resolved agent definitions with custom directory support
-    private static func resolvedAgents() -> [AgentDefinition] {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let customDirs = Defaults[.aiAgentCustomConfigDirs]
-
-        return agentTemplates.map { t in
-            let configDir: String
-            if let custom = customDirs[t.id], !custom.isEmpty {
-                configDir = (custom as NSString).expandingTildeInPath
-            } else {
-                configDir = (home as NSString).appendingPathComponent(t.defaultConfigDir)
-            }
-            let settingsFile = (configDir as NSString).appendingPathComponent(t.settingsFileName)
-            return AgentDefinition(
-                id: t.id,
-                name: t.name,
-                configDir: configDir,
-                settingsFile: settingsFile,
-                hookTypes: t.hookTypes,
-                requiresCodexHookFlag: t.requiresCodexHookFlag
-            )
-        }
-    }
-
-    /// All known AI agent tools and their settings file locations (legacy, resolved at call time)
-    private static var knownAgents: [AgentDefinition] {
-        resolvedAgents()
-    }
-
-    /// Codex feature flag path (required for codex hooks to run)
-    private static let codexConfigPath: String = {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return (home as NSString).appendingPathComponent(".codex/config.toml")
-    }()
-
-    /// Detect installed AI agent tools and their hook configuration status
-    func detectInstalledAgents() {
-        let fm = FileManager.default
-        bridgeInstalled = fm.fileExists(atPath: Self.bridgePath)
-
-        var agents: [DetectedAgent] = []
-
-        for agent in Self.resolvedAgents() {
-            let configExists = fm.fileExists(atPath: agent.configDir)
-            let settingsExists = fm.fileExists(atPath: agent.settingsFile)
-
-            var hookStatus: DetectedAgent.HookStatus = .notConfigured
-
-            if settingsExists {
-                // Check if hooks are already configured
-                if let data = fm.contents(atPath: agent.settingsFile),
-                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let hooks = json["hooks"] as? [String: Any]
-                {
-                    let jsonStr = String(data: data, encoding: .utf8) ?? ""
-                    let expectedHookNames = Set(agent.hookTypes.map(\.name))
-                    let configuredVlandHooks = configuredHookNames(in: hooks) { command in
-                        command.contains(Self.bridgePath) || command.contains("vland-bridge")
-                    }
-
-                    if expectedHookNames.isSubset(of: configuredVlandHooks) {
-                        hookStatus = .configuredVland
-                    } else if jsonStr.contains("vibe-island-bridge") {
-                        hookStatus = .configuredOther("vibe-island-bridge")
-                    } else if jsonStr.contains("agent-island-bridge") {
-                        hookStatus = .configuredOther("agent-island-bridge")
-                    } else if !hooks.isEmpty {
-                        // Has hooks but not for vland
-                        hookStatus = .notConfigured
-                    }
-                }
-            }
-
-            agents.append(DetectedAgent(
-                id: agent.id,
-                displayName: agent.name,
-                settingsPath: agent.settingsFile,
-                configDirExists: configExists,
-                settingsFileExists: settingsExists,
-                hookStatus: hookStatus
-            ))
-        }
-
-        detectedAgents = agents
-    }
-
-    /// Install the bridge script from bundled resources
-    func installBridgeScript() -> Bool {
-        let fm = FileManager.default
-        let bridgeDir = (Self.bridgePath as NSString).deletingLastPathComponent
-
-        do {
-            // Create directory
-            try fm.createDirectory(atPath: bridgeDir, withIntermediateDirectories: true)
-
-            // Copy from bundled resources
-            if let bundled = Self.bundledBridgePath {
-                if fm.fileExists(atPath: Self.bridgePath) {
-                    try fm.removeItem(atPath: Self.bridgePath)
-                }
-                try fm.copyItem(atPath: bundled, toPath: Self.bridgePath)
-            } else {
-                // Fallback: bridge is already installed (from previous setup)
-                guard fm.fileExists(atPath: Self.bridgePath) else {
-                    configurationLog.append("❌ Bridge script not found in app bundle")
-                    return false
-                }
-            }
-
-            // Make executable
-            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: Self.bridgePath)
-
-            bridgeInstalled = true
-            configurationLog.append("✅ Bridge script installed at \(Self.bridgePath)")
-            return true
-        } catch {
-            configurationLog.append("❌ Failed to install bridge: \(error.localizedDescription)")
-            return false
-        }
-    }
-
-    /// Build the hooks JSON structure for a given agent source
-    private func buildHooksDict(source: String, hookTypes: [HookTypeSpec]) -> [String: Any] {
-        var hooks: [String: Any] = [:]
-
-        for hookType in hookTypes {
-            var commandEntry: [String: Any] = [
-                "command": "\"\(Self.bridgePath)\" --source \(source)",
-                "type": "command",
-            ]
-            if let timeoutSeconds = hookType.timeoutSeconds {
-                commandEntry["timeout"] = timeoutSeconds
-            }
-
-            var hookEntry: [String: Any] = [
-                "hooks": [commandEntry]
-            ]
-            if let matcher = hookType.matcher, !matcher.isEmpty {
-                hookEntry["matcher"] = matcher
-            }
-            hooks[hookType.name] = [hookEntry]
-        }
-
-        return hooks
-    }
-
-    private func ensureCodexHooksEnabled() -> Bool {
-        let fm = FileManager.default
-        let configDir = (Self.codexConfigPath as NSString).deletingLastPathComponent
-
-        do {
-            if !fm.fileExists(atPath: configDir) {
-                try fm.createDirectory(atPath: configDir, withIntermediateDirectories: true)
-            }
-
-            let existing = (try? String(contentsOfFile: Self.codexConfigPath, encoding: .utf8)) ?? ""
-            let updated = upsertCodexHooksFlag(in: existing)
-
-            if updated != existing || !fm.fileExists(atPath: Self.codexConfigPath) {
-                try updated.write(toFile: Self.codexConfigPath, atomically: true, encoding: .utf8)
-                configurationLog.append("  ✅ Enabled codex hooks in \(Self.codexConfigPath)")
-            }
-            return true
-        } catch {
-            configurationLog.append("  ❌ Failed to enable codex hooks: \(error.localizedDescription)")
-            return false
-        }
-    }
-
-    private func upsertCodexHooksFlag(in config: String) -> String {
-        let lines = config.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        var output: [String] = []
-        var hasFeaturesSection = false
-        var inFeaturesSection = false
-        var insertedCodexFlag = false
-
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            let isSectionHeader = trimmed.hasPrefix("[") && trimmed.hasSuffix("]")
-
-            if isSectionHeader {
-                if inFeaturesSection && !insertedCodexFlag {
-                    output.append("codex_hooks = true")
-                    insertedCodexFlag = true
-                }
-                inFeaturesSection = (trimmed == "[features]")
-                if inFeaturesSection {
-                    hasFeaturesSection = true
-                }
-                output.append(line)
-                continue
-            }
-
-            if inFeaturesSection && trimmed.hasPrefix("codex_hooks") {
-                output.append("codex_hooks = true")
-                insertedCodexFlag = true
-            } else {
-                output.append(line)
-            }
-        }
-
-        if inFeaturesSection && !insertedCodexFlag {
-            output.append("codex_hooks = true")
-            insertedCodexFlag = true
-        }
-
-        if !hasFeaturesSection {
-            if !output.isEmpty && !(output.last ?? "").isEmpty {
-                output.append("")
-            }
-            output.append("[features]")
-            output.append("codex_hooks = true")
-        }
-
-        var result = output.joined(separator: "\n")
-        if !result.hasSuffix("\n") {
-            result.append("\n")
-        }
-        return result
-    }
-
-    /// Configure hooks for a specific agent
-    func configureAgent(_ agent: DetectedAgent) -> Bool {
-        let fm = FileManager.default
-        configurationLog.append("🔧 Configuring \(agent.displayName)...")
-
-        guard let agentDefinition = Self.resolvedAgents().first(where: { $0.id == agent.id }) else {
-            configurationLog.append("  ❌ Unknown agent: \(agent.id)")
-            return false
-        }
-
-        // Ensure bridge is installed
-        if !bridgeInstalled {
-            guard installBridgeScript() else { return false }
-        }
-
-        // Codex requires the feature flag in ~/.codex/config.toml
-        if agentDefinition.requiresCodexHookFlag {
-            guard ensureCodexHooksEnabled() else { return false }
-        }
-
-        // Ensure config directory exists
-        let configDir = (agent.settingsPath as NSString).deletingLastPathComponent
-        if !fm.fileExists(atPath: configDir) {
-            do {
-                try fm.createDirectory(atPath: configDir, withIntermediateDirectories: true)
-                configurationLog.append("  📁 Created \(configDir)")
-            } catch {
-                configurationLog.append("  ❌ Failed to create config dir: \(error.localizedDescription)")
-                return false
-            }
-        }
-
-        // Read existing settings or create new
-        var settings: [String: Any] = [:]
-        if fm.fileExists(atPath: agent.settingsPath),
-           let data = fm.contents(atPath: agent.settingsPath),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        {
-            settings = json
-        }
-
-        // Build and merge hooks
-        let newHooks = buildHooksDict(source: agent.id, hookTypes: agentDefinition.hookTypes)
-
-        if var existingHooks = settings["hooks"] as? [String: Any] {
-            // Merge: for each hook type, replace or add vland-bridge entries
-            for (hookName, hookValue) in newHooks {
-                if let existingEntries = existingHooks[hookName] as? [[String: Any]] {
-                    // Check if there are non-vland hooks to preserve
-                    var updatedEntries: [[String: Any]] = []
-
-                    for entry in existingEntries {
-                        if let entryHooks = entry["hooks"] as? [[String: Any]] {
-                            let hasOurHook = entryHooks.contains { hook in
-                                let cmd = hook["command"] as? String ?? ""
-                                return cmd.contains("vland-bridge")
-                                    || cmd.contains("vibe-island-bridge")
-                                    || cmd.contains("agent-island-bridge")
-                            }
-                            if hasOurHook {
-                                // Replace with vland version
-                            } else {
-                                updatedEntries.append(entry)
-                            }
-                        } else {
-                            updatedEntries.append(entry)
-                        }
-                    }
-
-                    // Add our hook entries
-                    if let newEntries = hookValue as? [[String: Any]] {
-                        updatedEntries.append(contentsOf: newEntries)
-                    }
-                    existingHooks[hookName] = updatedEntries
-                } else {
-                    existingHooks[hookName] = hookValue
-                }
-            }
-            settings["hooks"] = existingHooks
-        } else {
-            settings["hooks"] = newHooks
-        }
-
-        // Write back
-        do {
-            let data = try JSONSerialization.data(withJSONObject: settings, options: [.prettyPrinted, .sortedKeys])
-            try data.write(to: URL(fileURLWithPath: agent.settingsPath))
-            configurationLog.append("  ✅ \(agent.displayName) hooks configured")
-
-            // Update detection state
-            if let idx = detectedAgents.firstIndex(where: { $0.id == agent.id }) {
-                detectedAgents[idx].hookStatus = .configuredVland
-            }
-            return true
-        } catch {
-            configurationLog.append("  ❌ Failed to write settings: \(error.localizedDescription)")
-            return false
-        }
-    }
-
-    /// One-click: install bridge + configure all detected agents
-    func autoConfigureAll() {
-        configurationLog.removeAll()
-        configurationLog.append("🚀 Starting auto-configuration...")
-
-        // Step 1: Install bridge
-        if !bridgeInstalled {
-            configurationLog.append("📦 Installing bridge script...")
-            guard installBridgeScript() else {
-                configurationLog.append("❌ Auto-configuration failed: could not install bridge")
-                objectWillChange.send()
-                return
-            }
-        } else {
-            configurationLog.append("✅ Bridge script already installed")
-        }
-
-        // Step 2: Detect agents
-        detectInstalledAgents()
-
-        // Step 3: Configure each detected agent
-        var configuredCount = 0
-        for agent in detectedAgents where agent.configDirExists {
-            if agent.hookStatus == .configuredVland {
-                configurationLog.append("✅ \(agent.displayName) already configured")
-                configuredCount += 1
-            } else {
-                if configureAgent(agent) {
-                    configuredCount += 1
-                }
-            }
-        }
-
-        if configuredCount > 0 {
-            configurationLog.append("🎉 Done! Configured \(configuredCount) agent(s). Restart your AI agent to activate.")
-        } else {
-            configurationLog.append("⚠️ No AI agent tools detected. Install CodeBuddy, Codex CLI, Claude Code, or WorkBuddy first.")
-        }
-
-        objectWillChange.send()
-    }
-
-    private func configuredHookNames(
-        in hooks: [String: Any],
-        commandMatcher: (String) -> Bool
-    ) -> Set<String> {
-        var configured = Set<String>()
-
-        for (hookName, hookValue) in hooks {
-            guard let entries = hookValue as? [[String: Any]] else { continue }
-
-            let hasMatchingCommand = entries.contains { entry in
-                guard let commandHooks = entry["hooks"] as? [[String: Any]] else { return false }
-                return commandHooks.contains { hook in
-                    let command = hook["command"] as? String ?? ""
-                    return commandMatcher(command)
-                }
-            }
-
-            if hasMatchingCommand {
-                configured.insert(hookName)
-            }
-        }
-
-        return configured
-    }
+    func detectInstalledAgents() { hookConfigurator.detectInstalledAgents() }
+    func installBridgeScript() -> Bool { hookConfigurator.installBridgeScript() }
+    func configureAgent(_ agent: DetectedAgent) -> Bool { hookConfigurator.configureAgent(agent) }
+    func autoConfigureAll() { hookConfigurator.autoConfigureAll() }
 }

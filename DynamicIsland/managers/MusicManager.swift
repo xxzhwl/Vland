@@ -43,7 +43,7 @@ let defaultImage: NSImage = .init(
     accessibilityDescription: "Album Art"
 )!
 
-class MusicManager: ObservableObject {
+final class MusicManager: ObservableObject {
     enum SkipDirection: Equatable {
         case backward
         case forward
@@ -297,7 +297,10 @@ class MusicManager: ObservableObject {
     
     public func destroy() {
         debounceIdleTask?.cancel()
+        lyricSyncTask?.cancel()
+        workItem?.cancel()
         sourceCleanupTimer?.invalidate()
+        sourceCleanupTimer = nil
         cancellables.removeAll()
         transitionWorkItem?.cancel()
         teardownControllers()
@@ -425,7 +428,7 @@ class MusicManager: ObservableObject {
     }
 
     private func startSourceCleanupTimer() {
-        sourceCleanupTimer?.invalidate()
+        guard sourceCleanupTimer == nil else { return }
         sourceCleanupTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.refreshTrackedSourcesAndSelection()
