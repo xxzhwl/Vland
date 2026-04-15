@@ -742,6 +742,49 @@ def build_approval_interaction(message, title="Command Approval Required",
     )
 
 
+def build_permission_option_label(suggestion):
+    """Build a human-readable label for a permission_suggestions entry."""
+    if not isinstance(suggestion, dict):
+        return None
+
+    suggestion_type = suggestion.get("type")
+    behavior = suggestion.get("behavior")
+    destination = suggestion.get("destination")
+    rules = suggestion.get("rules")
+
+    if suggestion_type == "addRules" and behavior == "allow" and isinstance(rules, list):
+        parts = []
+        for rule in rules[:3]:
+            if not isinstance(rule, dict):
+                continue
+
+            tool = str(rule.get("toolName") or "").strip()
+            content = str(rule.get("ruleContent") or "").strip()
+            if content:
+                parts.append(f"{tool} {truncate(content, 60)}".strip())
+            elif tool:
+                parts.append(tool)
+
+        scope = ""
+        if destination == "session":
+            scope = " (this session)"
+        elif destination == "projectSettings":
+            scope = " (this project)"
+        elif destination == "userSettings":
+            scope = " (always)"
+
+        if parts:
+            return f"Yes, and don't ask again for {', '.join(parts)}{scope}"
+        return f"Yes, and always allow{scope}"
+
+    if suggestion_type == "setMode":
+        mode = suggestion.get("mode")
+        if mode:
+            return f"Switch to {mode} mode"
+
+    return None
+
+
 def compose_permission_message(tool_name, tool_input):
     display_name = str(tool_name or "Tool").strip() or "Tool"
     description = None
@@ -795,10 +838,43 @@ def extract_permission_request_interaction(source, stdin_data):
     tool_name = stdin_data.get("tool_name") or stdin_data.get("toolName") or "Tool"
     tool_input = parse_tool_input(stdin_data)
     title = f"{tool_name} Permission Required"
+    message = compose_permission_message(tool_name, tool_input)
+    bridge_response_kind = "claude_permission_request" if source == "claude-code" else None
+
+    permission_suggestions = stdin_data.get("permission_suggestions")
+    if isinstance(permission_suggestions, list) and permission_suggestions:
+        options = ["Allow"]
+        suggestion_map = {}
+
+        for suggestion in permission_suggestions:
+            label = build_permission_option_label(suggestion)
+            if label and label not in suggestion_map:
+                options.append(label)
+                suggestion_map[label] = suggestion
+
+        if suggestion_map:
+            options.append("Block")
+            bridge_response_context = encode_bridge_response_context({
+                "permission_suggestions": suggestion_map,
+            })
+            return build_interaction_payload(
+                interaction_type="confirmation",
+                title=title,
+                response_mode="approval_selection",
+                bridge_response_kind=bridge_response_kind,
+                bridge_response_context=bridge_response_context,
+                questions=[{
+                    "id": "approval",
+                    "question": message,
+                    "options": options,
+                    "multiSelect": False,
+                }],
+            )
+
     return build_approval_interaction(
-        message=compose_permission_message(tool_name, tool_input),
+        message=message,
         title=title,
-        bridge_response_kind="claude_permission_request" if source == "claude-code" else None,
+        bridge_response_kind=bridge_response_kind,
     )
 
 

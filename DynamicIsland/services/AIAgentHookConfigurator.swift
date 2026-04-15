@@ -439,15 +439,13 @@ final class AIAgentHookConfigurator: ObservableObject {
         configurationLog.removeAll()
         configurationLog.append("🚀 Starting auto-configuration...")
 
-        if !bridgeInstalled {
-            configurationLog.append("📦 Installing bridge script...")
-            guard installBridgeScript() else {
-                configurationLog.append("❌ Auto-configuration failed: could not install bridge")
-                objectWillChange.send()
-                return
-            }
-        } else {
-            configurationLog.append("✅ Bridge script already installed")
+        configurationLog.append(bridgeInstalled
+            ? "🔄 Refreshing bridge script..."
+            : "📦 Installing bridge script...")
+        guard installBridgeScript() else {
+            configurationLog.append("❌ Auto-configuration failed: could not install bridge")
+            objectWillChange.send()
+            return
         }
 
         detectInstalledAgents()

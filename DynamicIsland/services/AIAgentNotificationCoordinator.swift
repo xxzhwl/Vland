@@ -134,9 +134,10 @@ final class AIAgentNotificationCoordinator {
         switch result {
         case .submitted:
             if interaction.responseMode == .approvalSelection {
-                title = option.caseInsensitiveCompare("Allow") == .orderedSame ? "已批准" : "已阻止"
+                let isBlocked = AIAgentBridgeProtocol.isBlockOption(option)
+                title = isBlocked ? "已阻止" : "已批准"
                 subtitle = String(interaction.message.prefix(50))
-                accentColor = option.caseInsensitiveCompare("Allow") == .orderedSame ? .green : .red
+                accentColor = isBlocked ? .red : .green
             } else {
                 title = "已发送回复"
                 subtitle = String(option.prefix(50))

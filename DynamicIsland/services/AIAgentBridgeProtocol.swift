@@ -34,15 +34,14 @@ enum AIAgentBridgeProtocol {
 
         switch interaction.responseMode {
         case .approvalSelection:
-            if option.caseInsensitiveCompare("Allow") == .orderedSame
-                || option.caseInsensitiveCompare("Yes") == .orderedSame {
-                return ["decision": "allow"]
+            if isBlockOption(option) {
+                return [
+                    "decision": "block",
+                    "reason": "User rejected from Vland",
+                ]
             }
 
-            return [
-                "decision": "block",
-                "reason": "User rejected from Vland",
-            ]
+            return ["decision": "allow"]
 
         case .pasteReply:
             return [
@@ -61,26 +60,29 @@ enum AIAgentBridgeProtocol {
 
         switch kind {
         case "claude_permission_request":
-            if option.caseInsensitiveCompare("Allow") == .orderedSame
-                || option.caseInsensitiveCompare("Yes") == .orderedSame {
+            if isBlockOption(option) {
                 return [
                     "hookSpecificOutput": [
                         "hookEventName": "PermissionRequest",
                         "decision": [
-                            "behavior": "allow"
+                            "behavior": "deny",
+                            "message": "User rejected from Vland",
+                            "interrupt": false
                         ]
                     ]
                 ]
             }
 
+            let context = bridgeResponseContext(from: interaction.bridgeResponseContext)
+            var decision: [String: Any] = ["behavior": "allow"]
+            if let suggestion = permissionSuggestion(for: option, in: context) {
+                decision["updatedPermissions"] = [suggestion]
+            }
+
             return [
                 "hookSpecificOutput": [
                     "hookEventName": "PermissionRequest",
-                    "decision": [
-                        "behavior": "deny",
-                        "message": "User rejected from Vland",
-                        "interrupt": false
-                    ]
+                    "decision": decision
                 ]
             ]
 
@@ -123,24 +125,41 @@ enum AIAgentBridgeProtocol {
 
         case "codebuddy_approval":
             // Use CodeBuddy native hookSpecificOutput protocol
-            if option.caseInsensitiveCompare("Allow") == .orderedSame
-                || option.caseInsensitiveCompare("Yes") == .orderedSame {
+            if isBlockOption(option) {
                 return [
                     "hookSpecificOutput": [
-                        "permissionDecision": "allow"
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": "User rejected from Vland"
                     ]
                 ]
             }
+
             return [
                 "hookSpecificOutput": [
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": "User rejected from Vland"
+                    "permissionDecision": "allow"
                 ]
             ]
 
         default:
             return nil
         }
+    }
+
+    static func isBlockOption(_ option: String) -> Bool {
+        option.caseInsensitiveCompare("Block") == .orderedSame
+            || option.caseInsensitiveCompare("No") == .orderedSame
+    }
+
+    private static func permissionSuggestion(
+        for option: String,
+        in context: [String: Any]?
+    ) -> [String: Any]? {
+        guard let context,
+              let suggestions = context["permission_suggestions"] as? [String: Any],
+              let entry = suggestions[option] as? [String: Any] else {
+            return nil
+        }
+        return entry
     }
 
     private static func bridgeResponseContext(from rawValue: String?) -> [String: Any]? {
