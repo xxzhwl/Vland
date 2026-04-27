@@ -27,6 +27,17 @@ import Foundation
 /// invoked by the Settings UI.
 @MainActor
 final class AIAgentHookConfigurator: ObservableObject {
+    struct BridgeVersionStatus: Equatable {
+        let installedVersion: String?
+        let bundledVersion: String?
+
+        var isInstalled: Bool { installedVersion != nil }
+        var isOutdated: Bool {
+            guard let installedVersion, let bundledVersion else { return false }
+            return installedVersion != bundledVersion
+        }
+    }
+
     /// Represents a detected AI agent tool installation
     struct DetectedAgent: Identifiable {
         let id: String
@@ -46,6 +57,7 @@ final class AIAgentHookConfigurator: ObservableObject {
     /// Published detection results for the Settings UI
     @Published var detectedAgents: [DetectedAgent] = []
     @Published var bridgeInstalled: Bool = false
+    @Published var bridgeVersionStatus = BridgeVersionStatus(installedVersion: nil, bundledVersion: nil)
     @Published var configurationLog: [String] = []
 
     /// The bridge script path that Vland uses
@@ -164,11 +176,17 @@ final class AIAgentHookConfigurator: ObservableObject {
         return (home as NSString).appendingPathComponent(".codex/config.toml")
     }()
 
+    private static let bridgeVersionPattern = #"VLAND_BRIDGE_VERSION\s*=\s*"([^"]+)""#
+
     // MARK: - Detection
 
     func detectInstalledAgents() {
         let fm = FileManager.default
         bridgeInstalled = fm.fileExists(atPath: Self.bridgePath)
+        bridgeVersionStatus = BridgeVersionStatus(
+            installedVersion: Self.bridgeVersion(at: Self.bridgePath),
+            bundledVersion: Self.bundledBridgePath.flatMap { Self.bridgeVersion(at: $0) }
+        )
 
         var agents: [DetectedAgent] = []
 
@@ -219,6 +237,8 @@ final class AIAgentHookConfigurator: ObservableObject {
     func installBridgeScript() -> Bool {
         let fm = FileManager.default
         let bridgeDir = (Self.bridgePath as NSString).deletingLastPathComponent
+        let previousVersion = Self.bridgeVersion(at: Self.bridgePath)
+        let bundledVersion = Self.bundledBridgePath.flatMap { Self.bridgeVersion(at: $0) }
 
         do {
             try fm.createDirectory(atPath: bridgeDir, withIntermediateDirectories: true)
@@ -238,7 +258,18 @@ final class AIAgentHookConfigurator: ObservableObject {
             try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: Self.bridgePath)
 
             bridgeInstalled = true
-            configurationLog.append("✅ Bridge script installed at \(Self.bridgePath)")
+            bridgeVersionStatus = BridgeVersionStatus(
+                installedVersion: Self.bridgeVersion(at: Self.bridgePath),
+                bundledVersion: bundledVersion
+            )
+
+            if let previousVersion, let installedVersion = bridgeVersionStatus.installedVersion {
+                configurationLog.append("✅ Bridge script updated: \(previousVersion) -> \(installedVersion)")
+            } else if let installedVersion = bridgeVersionStatus.installedVersion {
+                configurationLog.append("✅ Bridge script installed at \(Self.bridgePath) (v\(installedVersion))")
+            } else {
+                configurationLog.append("✅ Bridge script installed at \(Self.bridgePath)")
+            }
             return true
         } catch {
             configurationLog.append("❌ Failed to install bridge: \(error.localizedDescription)")
@@ -494,5 +525,17 @@ final class AIAgentHookConfigurator: ObservableObject {
         }
 
         return configured
+    }
+
+    private static func bridgeVersion(at path: String) -> String? {
+        guard let contents = try? String(contentsOfFile: path, encoding: .utf8),
+              let regex = try? NSRegularExpression(pattern: bridgeVersionPattern),
+              let match = regex.firstMatch(in: contents, range: NSRange(contents.startIndex..., in: contents)),
+              let range = Range(match.range(at: 1), in: contents) else {
+            return nil
+        }
+
+        let version = String(contents[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return version.isEmpty ? nil : version
     }
 }

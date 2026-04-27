@@ -140,6 +140,21 @@ enum AIAgentBridgeProtocol {
                 ]
             ]
 
+        case "codex_approval":
+            if isBlockOption(option) {
+                return [
+                    "hookSpecificOutput": [
+                        "permissionDecision": "deny"
+                    ]
+                ]
+            }
+
+            return [
+                "hookSpecificOutput": [
+                    "permissionDecision": "allow"
+                ]
+            ]
+
         default:
             return nil
         }

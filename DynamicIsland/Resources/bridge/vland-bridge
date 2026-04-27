@@ -25,6 +25,8 @@ import argparse
 import hashlib
 from datetime import datetime
 
+VLAND_BRIDGE_VERSION = "2026.04.24.1"
+
 SOCKET_PATH = os.path.join(os.environ.get("TMPDIR", "/tmp"), "vland-ai-agent.sock")
 
 MAX_PROMPT_LEN = 2000
@@ -827,6 +829,8 @@ def extract_direct_tool_approval_interaction(source, stdin_data):
     bridge_response_kind = None
     if source in ("codebuddy", "workbuddy"):
         bridge_response_kind = "codebuddy_approval"
+    elif source == "codex":
+        bridge_response_kind = "codex_approval"
 
     return build_approval_interaction(message, bridge_response_kind=bridge_response_kind)
 
@@ -928,7 +932,12 @@ def extract_question_interaction(source, stdin_data):
 def extract_transcript_approval_interaction(source, stdin_data):
     tool_input = parse_tool_input(stdin_data)
     current_command = tool_input.get("cmd") or tool_input.get("command") if isinstance(tool_input, dict) else None
-    bridge_response_kind = "codebuddy_approval" if source in ("codebuddy", "workbuddy") else None
+    if source in ("codebuddy", "workbuddy"):
+        bridge_response_kind = "codebuddy_approval"
+    elif source == "codex":
+        bridge_response_kind = "codex_approval"
+    else:
+        bridge_response_kind = None
     return extract_pending_approval_from_transcript(stdin_data, current_command=current_command, bridge_response_kind=bridge_response_kind)
 
 

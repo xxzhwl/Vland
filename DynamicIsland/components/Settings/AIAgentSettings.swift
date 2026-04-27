@@ -83,6 +83,46 @@ struct AIAgentSettings: View {
         )
     }
 
+    private var bridgeVersionStatus: AIAgentHookConfigurator.BridgeVersionStatus {
+        agentManager.hookConfig.bridgeVersionStatus
+    }
+
+    private var bridgeStatusIcon: String {
+        if !agentManager.hookConfig.bridgeInstalled {
+            return "xmark.circle.fill"
+        }
+        return bridgeVersionStatus.isOutdated ? "arrow.triangle.2.circlepath.circle.fill" : "checkmark.circle.fill"
+    }
+
+    private var bridgeStatusColor: Color {
+        if !agentManager.hookConfig.bridgeInstalled {
+            return .red
+        }
+        return bridgeVersionStatus.isOutdated ? .orange : .green
+    }
+
+    private var bridgeStatusText: String {
+        if !agentManager.hookConfig.bridgeInstalled {
+            return "未安装"
+        }
+        return bridgeVersionStatus.isOutdated
+            ? "已安装，但不是最新版本"
+            : "已安装于 ~/.vland/bin/vland-bridge"
+    }
+
+    private var bridgeVersionText: String? {
+        let installed = bridgeVersionStatus.installedVersion ?? "unknown"
+        guard let latest = bridgeVersionStatus.bundledVersion else {
+            return agentManager.hookConfig.bridgeInstalled ? "本地版本: \(installed)" : nil
+        }
+
+        if !agentManager.hookConfig.bridgeInstalled {
+            return "最新版本: \(latest)"
+        }
+
+        return "本地版本: \(installed)  ·  最新版本: \(latest)"
+    }
+
     private var presetOptions: [(name: String, theme: AIAgentCardTheme)] {
         [
             ("Default", .defaultTheme),
@@ -155,15 +195,20 @@ struct AIAgentSettings: View {
                 Section {
                     // Bridge script status
                     HStack {
-                        Image(systemName: agentManager.hookConfig.bridgeInstalled ? "checkmark.circle.fill" : "xmark.circle.fill")
-                            .foregroundColor(agentManager.hookConfig.bridgeInstalled ? .green : .red)
+                        Image(systemName: bridgeStatusIcon)
+                            .foregroundColor(bridgeStatusColor)
                             .font(.system(size: 14))
                         VStack(alignment: .leading, spacing: 1) {
                             Text("桥接脚本")
                                 .font(.system(size: 12, weight: .medium))
-                            Text(agentManager.hookConfig.bridgeInstalled ? "已安装于 ~/.vland/bin/vland-bridge" : "未安装")
+                            Text(bridgeStatusText)
                                 .font(.system(size: 10))
                                 .foregroundStyle(.secondary)
+                            if let detail = bridgeVersionText {
+                                Text(detail)
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(agentManager.hookConfig.bridgeVersionStatus.isOutdated ? .orange : .secondary)
+                            }
                         }
                     }
 

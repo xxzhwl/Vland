@@ -582,6 +582,18 @@ final class AIAgentManager: ObservableObject {
         if let interactionID = pendingBridgeResponseIDsByConnection[connection],
            let pending = cleanupPendingBridgeResponse(interactionID),
            let session = sessionStore.session(forKey: pending.sessionKey) {
+            if let interaction = interaction(in: session, interactionID: interactionID),
+               interaction.bridgeResponseKind == "codex_approval" {
+                session.resolveInteraction(
+                    id: interactionID,
+                    state: .submitted("Handled in Codex"),
+                    taskOverride: "Approval handled in Codex",
+                    statusOverride: .thinking
+                )
+                syncSessionsFromStore()
+                return
+            }
+
             let message = interactionMessage(in: session, interactionID: interactionID)
                 ?? "Interaction timed out."
             session.resolveInteraction(
@@ -678,9 +690,13 @@ final class AIAgentManager: ObservableObject {
     }
 
     private func interactionMessage(in session: AIAgentSession, interactionID: UUID) -> String? {
+        interaction(in: session, interactionID: interactionID)?.message
+    }
+
+    private func interaction(in session: AIAgentSession, interactionID: UUID) -> AIAgentInteraction? {
         for turn in session.conversationTurns {
             if let interaction = turn.interactions.first(where: { $0.id == interactionID }) {
-                return interaction.message
+                return interaction
             }
         }
         return nil
@@ -694,7 +710,11 @@ final class AIAgentManager: ObservableObject {
 
         latestInteractionPresentationID = UUID()
         AIAgentSoundEffectManager.shared.play(.waitingInput)
-        notificationCoordinator.notifyWaitingInput(session: session, interaction: interaction, isBridge: false)
+        notificationCoordinator.notifyWaitingInput(
+            session: session,
+            interaction: interaction,
+            isBridge: hasPendingBridgeResponse(for: interaction.id)
+        )
     }
 
     private func isTodoOrPlanTool(_ toolName: String?) -> Bool {
