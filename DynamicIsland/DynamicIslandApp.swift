@@ -116,6 +116,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let systemTimerBridge = SystemTimerBridge.shared
     let extensionXPCServiceHost = ExtensionXPCServiceHost.shared
     let extensionRPCServer = ExtensionRPCServer.shared
+    let quotaMonitorManager = QuotaMonitorManager.shared
     var closeNotchWorkItem: DispatchWorkItem?
     private var previousScreens: [NSScreen]?
     private var onboardingWindowController: NSWindowController?

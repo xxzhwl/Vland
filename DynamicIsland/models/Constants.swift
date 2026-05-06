@@ -964,6 +964,9 @@ extension Defaults.Keys {
     static let aiAgentShowToolDetails = Key<Bool>("aiAgentShowToolDetails", default: true)
     static let aiAgentShowToolOutput = Key<Bool>("aiAgentShowToolOutput", default: false)
     static let aiAgentExpandedMaxHeightFraction = Key<Double>("aiAgentExpandedMaxHeightFraction", default: 0.4)
+    static let aiAgentQuotaMonitorEnabled = Key<Bool>("aiAgentQuotaMonitorEnabled", default: true)
+    static let aiAgentQuotaShowRing = Key<Bool>("aiAgentQuotaShowRing", default: true)
+    static let aiAgentQuotaShowInlineBar = Key<Bool>("aiAgentQuotaShowInlineBar", default: true)
 
     // MARK: AI Agent Card Theme
     static let aiAgentThemeMode = Key<AIAgentThemeMode>("aiAgentThemeMode", default: .perAgent)

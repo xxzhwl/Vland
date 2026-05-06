@@ -24,11 +24,15 @@ struct AIAgentSettings: View {
     @Default(.aiAgentShowToolDetails) var aiAgentShowToolDetails
     @Default(.aiAgentShowToolOutput) var aiAgentShowToolOutput
     @Default(.aiAgentExpandedMaxHeightFraction) var aiAgentExpandedMaxHeightFraction
+    @Default(.aiAgentQuotaMonitorEnabled) var aiAgentQuotaMonitorEnabled
+    @Default(.aiAgentQuotaShowRing) var aiAgentQuotaShowRing
+    @Default(.aiAgentQuotaShowInlineBar) var aiAgentQuotaShowInlineBar
     @Default(.aiAgentThemeMode) private var themeMode
     @Default(.aiAgentCardTheme) private var cardTheme
     @Default(.aiAgentUniformAccentColor) private var uniformAccentColor
     @Default(.aiAgentCustomConfigDirs) private var aiAgentCustomConfigDirs
     @ObservedObject var agentManager = AIAgentManager.shared
+    @ObservedObject private var quotaMonitor = QuotaMonitorManager.shared
     @ObservedObject private var accessibilityPermission = AccessibilityPermissionStore.shared
     @State private var isConfiguring = false
     @State private var isIconImporterPresented = false
@@ -189,6 +193,58 @@ struct AIAgentSettings: View {
                     }
                 } header: {
                     Text("状态")
+                }
+
+                Section {
+                    Defaults.Toggle(key: .aiAgentQuotaMonitorEnabled) {
+                        Text("显示 Token / 配额余量")
+                    }
+                    .settingsHighlight(id: highlightID("Show Token Quota"))
+
+                    Defaults.Toggle(key: .aiAgentQuotaShowRing) {
+                        Text("在会话头部显示余量环")
+                    }
+                    .disabled(!aiAgentQuotaMonitorEnabled)
+
+                    Defaults.Toggle(key: .aiAgentQuotaShowInlineBar) {
+                        Text("在展开卡片中显示余量条")
+                    }
+                    .disabled(!aiAgentQuotaMonitorEnabled)
+
+                    HStack {
+                        Text("Codex 数据源")
+                        Spacer()
+                        quotaStatusLabel(for: .codex)
+                    }
+
+                    HStack {
+                        Text("Claude VS Code 数据源")
+                        Spacer()
+                        quotaStatusLabel(for: .claudeCode)
+                    }
+
+                    HStack(alignment: .top, spacing: 10) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Claude CLI Hook")
+                            Text(claudeQuotaHookDescription)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Spacer()
+
+                        Button(claudeQuotaButtonTitle) {
+                            _ = agentManager.hookConfig.installClaudeQuotaHook()
+                        }
+                        .font(.system(size: 11))
+                        .buttonStyle(.borderless)
+                    }
+                } header: {
+                    Text("额度监控")
+                } footer: {
+                    Text("Codex 会从 ~/.codex/sessions 的 rollout 日志读取额度信息。Claude Code 当前读取 VS Code / Cursor 的插件日志；若一直为空，需要把插件日志级别调到 debug。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 // MARK: AI 助手管理 (Unified)
@@ -556,12 +612,14 @@ struct AIAgentSettings: View {
         .onAppear {
             if enableAIAgentFeature {
                 agentManager.detectInstalledAgents()
+                agentManager.hookConfig.detectClaudeQuotaHookStatus()
             }
             refreshPreviewSessions()
         }
-        .onChange(of: enableAIAgentFeature) { newValue in
+        .onChange(of: enableAIAgentFeature) { _, newValue in
             if newValue {
                 agentManager.detectInstalledAgents()
+                agentManager.hookConfig.detectClaudeQuotaHookStatus()
             }
         }
         .fileImporter(
@@ -575,6 +633,50 @@ struct AIAgentSettings: View {
                 iconImportError = "图标导入已取消或失败。"
             }
         }
+    }
+
+    private func quotaStatusLabel(for agent: AIAgentType) -> some View {
+        let snapshot = quotaMonitor.snapshot(for: agent)
+        let probeState = snapshot?.probeState ?? .unavailable
+        let label: String
+        let tint: Color
+
+        switch probeState {
+        case .available:
+            label = snapshot?.primaryWindow?.remainingDisplayText ?? "可用"
+            tint = .green
+        case .stale:
+            label = "数据陈旧"
+            tint = .orange
+        case .notConfigured:
+            label = "未检测到"
+            tint = .gray
+        case .unavailable:
+            label = "暂无数据"
+            tint = .gray
+        }
+
+        return Text(label)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(tint)
+    }
+
+    private var claudeQuotaButtonTitle: String {
+        agentManager.hookConfig.claudeQuotaHookStatus.isInstalled ? "更新 Hook" : "安装 Hook"
+    }
+
+    private var claudeQuotaHookDescription: String {
+        let status = agentManager.hookConfig.claudeQuotaHookStatus
+        if let updatedAt = status.lastUpdatedAt {
+            return "已接入，最近写入 \(updatedAt.formatted(date: .omitted, time: .standard))"
+        }
+        if status.isInstalled {
+            return "已接入，等待 Claude Code 写入额度数据"
+        }
+        if let preserved = status.preservedCommand, !preserved.isEmpty {
+            return "会保留并透传现有 statusLine：\(preserved)"
+        }
+        return "安装后会拦截 Claude Code 的 rate_limits 并继续执行原有 statusLine"
     }
 
     // MARK: - Helper functions for agent display

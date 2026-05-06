@@ -168,7 +168,11 @@ struct AIAgentSessionCard: View {
     @State private var isExpanded = false
     @State private var lastAutoExpandedInteractionID: UUID?
     @ObservedObject var agentManager = AIAgentManager.shared
+    @ObservedObject private var quotaMonitor = QuotaMonitorManager.shared
     @Default(.aiAgentChatDisplayMode) private var chatDisplayMode
+    @Default(.aiAgentQuotaMonitorEnabled) private var quotaMonitorEnabled
+    @Default(.aiAgentQuotaShowRing) private var quotaShowRing
+    @Default(.aiAgentQuotaShowInlineBar) private var quotaShowInlineBar
 
     private var totalTodoCount: Int {
         session.todoItems.count
@@ -241,6 +245,14 @@ struct AIAgentSessionCard: View {
 
     private var agentIconImage: NSImage? {
         AIAgentIconResolver.image(for: session.agentType)
+    }
+
+    private var quotaSnapshot: QuotaSnapshot? {
+        quotaMonitor.snapshot(for: session.agentType)
+    }
+
+    private var primaryQuotaWindow: QuotaWindow? {
+        quotaSnapshot?.primaryWindow
     }
 
     var body: some View {
@@ -348,6 +360,17 @@ struct AIAgentSessionCard: View {
                         } else if session.compactCount > 0 {
                             statusChip(text: "已压缩×\(session.compactCount)", tint: .yellow)
                                 .padding(.leading, 6)
+                        }
+
+                        if quotaMonitorEnabled,
+                           quotaShowRing,
+                           let primaryQuotaWindow {
+                            QuotaRingBadge(
+                                window: primaryQuotaWindow,
+                                style: style,
+                                fallbackTint: style.accentColor(for: session.agentType)
+                            )
+                            .padding(.leading, 6)
                         }
 
                         Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
@@ -540,6 +563,18 @@ struct AIAgentSessionCard: View {
     private var expandedContent: some View {
         VStack(alignment: .leading, spacing: 0) {
             Divider().background(Color.white.opacity(0.08))
+
+            if quotaMonitorEnabled,
+               quotaShowInlineBar,
+               let quotaSnapshot {
+                QuotaInlineBar(
+                    snapshot: quotaSnapshot,
+                    style: style,
+                    accentColor: style.accentColor(for: session.agentType)
+                )
+                .padding(.horizontal, 10)
+                .padding(.top, 8)
+            }
 
             // Mode switch header
             if session.agentType.supportsFullHistory {

@@ -59,6 +59,7 @@ final class AIAgentHookConfigurator: ObservableObject {
     @Published var bridgeInstalled: Bool = false
     @Published var bridgeVersionStatus = BridgeVersionStatus(installedVersion: nil, bundledVersion: nil)
     @Published var configurationLog: [String] = []
+    @Published var claudeQuotaHookStatus = ClaudeQuotaHookStatus()
 
     /// The bridge script path that Vland uses
     static let bridgePath: String = {
@@ -72,6 +73,14 @@ final class AIAgentHookConfigurator: ObservableObject {
             return path
         }
         return Bundle.main.path(forResource: "vland-bridge", ofType: nil)
+    }
+
+    struct ClaudeQuotaHookStatus: Equatable {
+        var isInstalled = false
+        var usageFilePath: String?
+        var wrapperPath: String?
+        var lastUpdatedAt: Date?
+        var preservedCommand: String?
     }
 
     private struct HookTypeSpec {
@@ -176,6 +185,44 @@ final class AIAgentHookConfigurator: ObservableObject {
         return (home as NSString).appendingPathComponent(".codex/config.toml")
     }()
 
+    private static let claudeSettingsPath: String = {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return (home as NSString).appendingPathComponent(".claude/settings.json")
+    }()
+
+    private static let claudeQuotaDir: String = {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return (home as NSString).appendingPathComponent(".vland/quota")
+    }()
+
+    private static let claudeQuotaWrapperName = "claude-status-wrapper.sh"
+    private static let claudeQuotaCollectorName = "claude-status-collector.py"
+    private static let claudeQuotaUsageFileName = "claude-usage.json"
+    private static let claudeQuotaPreservedCommandName = "claude-status-preserved-cmd.txt"
+
+    private static var claudeQuotaWrapperPath: String {
+        (claudeQuotaDir as NSString).appendingPathComponent(claudeQuotaWrapperName)
+    }
+
+    private static var claudeQuotaCollectorPath: String {
+        (claudeQuotaDir as NSString).appendingPathComponent(claudeQuotaCollectorName)
+    }
+
+    private static var claudeQuotaUsagePath: String {
+        (claudeQuotaDir as NSString).appendingPathComponent(claudeQuotaUsageFileName)
+    }
+
+    private static var claudeQuotaPreservedCommandPath: String {
+        (claudeQuotaDir as NSString).appendingPathComponent(claudeQuotaPreservedCommandName)
+    }
+
+    private static func bundledClaudeQuotaResource(named name: String) -> String? {
+        if let path = Bundle.main.path(forResource: name, ofType: nil, inDirectory: "quota") {
+            return path
+        }
+        return Bundle.main.path(forResource: name, ofType: nil)
+    }
+
     private static let bridgeVersionPattern = #"VLAND_BRIDGE_VERSION\s*=\s*"([^"]+)""#
 
     // MARK: - Detection
@@ -230,6 +277,44 @@ final class AIAgentHookConfigurator: ObservableObject {
         }
 
         detectedAgents = agents
+        detectClaudeQuotaHookStatus()
+    }
+
+    func detectClaudeQuotaHookStatus() {
+        let fm = FileManager.default
+        let settingsPath = Self.claudeSettingsPath
+        let wrapperPath = Self.claudeQuotaWrapperPath
+        let usagePath = Self.claudeQuotaUsagePath
+        let preservedPath = Self.claudeQuotaPreservedCommandPath
+
+        var currentStatus = ClaudeQuotaHookStatus()
+        currentStatus.wrapperPath = wrapperPath
+        currentStatus.usageFilePath = usagePath
+
+        if fm.fileExists(atPath: usagePath),
+           let attrs = try? fm.attributesOfItem(atPath: usagePath),
+           let date = attrs[.modificationDate] as? Date {
+            currentStatus.lastUpdatedAt = date
+        }
+
+        if fm.fileExists(atPath: preservedPath),
+           let preserved = try? String(contentsOfFile: preservedPath, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !preserved.isEmpty {
+            currentStatus.preservedCommand = preserved
+        }
+
+        if fm.fileExists(atPath: settingsPath),
+           let data = fm.contents(atPath: settingsPath),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let statusLine = json["statusLine"] as? [String: Any],
+           let command = statusLine["command"] as? String {
+            currentStatus.isInstalled = command.contains(wrapperPath)
+        } else {
+            currentStatus.isInstalled = fm.fileExists(atPath: wrapperPath)
+        }
+
+        claudeQuotaHookStatus = currentStatus
     }
 
     // MARK: - Bridge Installation
@@ -273,6 +358,73 @@ final class AIAgentHookConfigurator: ObservableObject {
             return true
         } catch {
             configurationLog.append("❌ Failed to install bridge: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    func installClaudeQuotaHook() -> Bool {
+        let fm = FileManager.default
+        configurationLog.append("🔧 Configuring Claude Code quota hook...")
+
+        do {
+            try fm.createDirectory(atPath: Self.claudeQuotaDir, withIntermediateDirectories: true)
+
+            guard let bundledWrapper = Self.bundledClaudeQuotaResource(named: Self.claudeQuotaWrapperName),
+                  let bundledCollector = Self.bundledClaudeQuotaResource(named: Self.claudeQuotaCollectorName) else {
+                configurationLog.append("  ❌ Bundled quota scripts not found")
+                return false
+            }
+
+            try installQuotaResource(from: bundledWrapper, to: Self.claudeQuotaWrapperPath)
+            try installQuotaResource(from: bundledCollector, to: Self.claudeQuotaCollectorPath)
+
+            let settingsURL = URL(fileURLWithPath: Self.claudeSettingsPath)
+            let settingsDir = settingsURL.deletingLastPathComponent()
+            try fm.createDirectory(at: settingsDir, withIntermediateDirectories: true)
+
+            var settings: [String: Any] = [:]
+            if fm.fileExists(atPath: settingsURL.path),
+               let data = try? Data(contentsOf: settingsURL),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                settings = json
+            }
+
+            let existingStatusLine = settings["statusLine"] as? [String: Any]
+            let existingCommand = (existingStatusLine?["command"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if let existingCommand,
+               !existingCommand.isEmpty,
+               !existingCommand.contains(Self.claudeQuotaWrapperPath) {
+                try existingCommand.write(
+                    toFile: Self.claudeQuotaPreservedCommandPath,
+                    atomically: true,
+                    encoding: .utf8
+                )
+            }
+
+            if fm.fileExists(atPath: settingsURL.path) {
+                let backupPath = settingsURL.path + ".vland-quota-backup-\(quotaTimestamp())"
+                try? fm.copyItem(atPath: settingsURL.path, toPath: backupPath)
+                configurationLog.append("  💾 Backed up Claude settings to \(backupPath)")
+            }
+
+            settings["statusLine"] = [
+                "type": "command",
+                "command": Self.claudeQuotaWrapperPath,
+            ]
+
+            let data = try JSONSerialization.data(withJSONObject: settings, options: [.prettyPrinted, .sortedKeys])
+            try atomicWrite(data: data, to: settingsURL)
+
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: Self.claudeQuotaWrapperPath)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: Self.claudeQuotaCollectorPath)
+
+            configurationLog.append("  ✅ Claude Code quota hook installed")
+            detectClaudeQuotaHookStatus()
+            return true
+        } catch {
+            configurationLog.append("  ❌ Failed to install Claude quota hook: \(error.localizedDescription)")
+            detectClaudeQuotaHookStatus()
             return false
         }
     }
@@ -537,5 +689,29 @@ final class AIAgentHookConfigurator: ObservableObject {
 
         let version = String(contents[range]).trimmingCharacters(in: .whitespacesAndNewlines)
         return version.isEmpty ? nil : version
+    }
+
+    private func installQuotaResource(from bundledPath: String, to destinationPath: String) throws {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: destinationPath) {
+            try fm.removeItem(atPath: destinationPath)
+        }
+        try fm.copyItem(atPath: bundledPath, toPath: destinationPath)
+    }
+
+    private func atomicWrite(data: Data, to url: URL) throws {
+        let tmpURL = url.deletingLastPathComponent()
+            .appendingPathComponent(url.lastPathComponent + ".tmp")
+        try data.write(to: tmpURL, options: .atomic)
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+        try FileManager.default.moveItem(at: tmpURL, to: url)
+    }
+
+    private func quotaTimestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return formatter.string(from: Date())
     }
 }

@@ -35,7 +35,9 @@ class FullscreenMediaDetector: ObservableObject {
         self.detector = MacroVisionKit.shared
         detector.configuration.includeSystemApps = true
         setupNotificationObservers()
-        updateFullScreenStatus()
+        Task { [weak self] in
+            await self?.updateFullScreenStatus()
+        }
     }
 
     private func setupNotificationObservers() {
@@ -45,17 +47,17 @@ class FullscreenMediaDetector: ObservableObject {
                     let activeSpaceNotifications = NSWorkspace.shared.notificationCenter.notifications(
                         named: NSWorkspace.activeSpaceDidChangeNotification
                     )
-                    
+
                     for await _ in activeSpaceNotifications {
                         await self?.handleChange()
                     }
                 }
-                
+
                 group.addTask {
                     let screenParameterNotifications = NSWorkspace.shared.notificationCenter.notifications(
                         named:  NSApplication.didChangeScreenParametersNotification
                     )
-                    
+
                     for await _ in screenParameterNotifications {
                         await  self?.handleChange()
                     }
@@ -66,10 +68,11 @@ class FullscreenMediaDetector: ObservableObject {
 
     private func handleChange() async {
         try? await Task.sleep(for: .milliseconds(500))
-        self.updateFullScreenStatus()
+        await self.updateFullScreenStatus()
     }
 
-    private func updateFullScreenStatus() {
+    @MainActor
+    private func updateFullScreenStatus() async {
         guard Defaults[.enableFullscreenMediaDetection] else {
             let reset = Dictionary(uniqueKeysWithValues: NSScreen.screens.map { ($0.localizedName, false) })
             if reset != fullscreenStatus {
@@ -77,13 +80,18 @@ class FullscreenMediaDetector: ObservableObject {
             }
             return
         }
-        
 
         let apps = detector.detectFullscreenApps(debug: false)
-        let names = NSScreen.screens.map { $0.localizedName }
+        let allNames = NSScreen.screens.map { $0.localizedName }
         var newStatus: [String: Bool] = [:]
-        for name in names {
-            newStatus[name] = apps.contains { $0.screen.localizedName == name && $0.bundleIdentifier != "com.apple.finder" && ($0.bundleIdentifier == musicManager.bundleIdentifier || Defaults[.hideNotchOption] == .always) }
+        for name in allNames {
+            let musicBundle = musicManager.bundleIdentifier
+            let hit = apps.contains { info in
+                info.screen.localizedName == name
+                    && info.bundleIdentifier != "com.apple.finder"
+                    && ((info.bundleIdentifier == musicBundle) || Defaults[.hideNotchOption] == .always)
+            }
+            newStatus[name] = hit
         }
 
         if newStatus != fullscreenStatus {
