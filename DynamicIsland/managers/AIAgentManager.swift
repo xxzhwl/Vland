@@ -61,12 +61,12 @@ final class AIAgentManager: ObservableObject {
     private let appActivator = AIAgentAppActivator()
     private lazy var notificationCoordinator = AIAgentNotificationCoordinator(appActivator: appActivator)
     private var cancellables = Set<AnyCancellable>()
-    private var staleSessionTimer: Timer?
     private var pendingSessionRemovalItems: [String: DispatchWorkItem] = [:]
     private let minimumActiveSessionVisibilityTimeout: TimeInterval = 45
     private var presentedInteractionKeys = Set<String>()
     private var pendingBridgeResponsesByInteractionID: [UUID: PendingBridgeResponse] = [:]
     private var pendingBridgeResponseIDsByConnection: [AIAgentSocketServer.ClientConnection: UUID] = [:]
+    private var bridgeRequestIdToInteractionID: [String: UUID] = [:]
 
     private struct PasteboardSnapshot {
         let items: [[NSPasteboard.PasteboardType: Data]]
@@ -100,6 +100,7 @@ final class AIAgentManager: ObservableObject {
         let interactionID: UUID
         let sessionKey: String
         let connection: AIAgentSocketServer.ClientConnection
+        let bridgeRequestId: String?
     }
 
     // MARK: - Computed Properties
@@ -457,9 +458,6 @@ final class AIAgentManager: ObservableObject {
 
             if isListening {
                 self.startStaleSessionCleanup()
-            } else {
-                self.staleSessionTimer?.invalidate()
-                self.staleSessionTimer = nil
             }
         }
 
@@ -489,8 +487,7 @@ final class AIAgentManager: ObservableObject {
         pendingBridgeResponsesByInteractionID.removeAll()
         pendingBridgeResponseIDsByConnection.removeAll()
         pendingBridgeInteractionIDs.removeAll()
-        staleSessionTimer?.invalidate()
-        staleSessionTimer = nil
+        bridgeRequestIdToInteractionID.removeAll()
         pendingSessionRemovalItems.values.forEach { $0.cancel() }
         pendingSessionRemovalItems.removeAll()
     }
@@ -502,6 +499,15 @@ final class AIAgentManager: ObservableObject {
         _ event: AIAgentHookEvent,
         connection: AIAgentSocketServer.ClientConnection
     ) -> AIAgentSession {
+        // BridgeDropped: bridge timed out without getting a response from Vland.
+        // This happens when the user approved/rejected the action directly in the CLI.
+        // Resolve the pending interaction gracefully so the UI doesn't show a stale
+        // pending approval or an error state.
+        if event.hookType == "BridgeDropped" {
+            handleBridgeDropped(event)
+            return AIAgentSession(agentType: .codebuddy)
+        }
+
         let result = eventReducer.reduce(event, in: sessionStore)
         let session = result.session
 
@@ -555,11 +561,15 @@ final class AIAgentManager: ObservableObject {
         let pending = PendingBridgeResponse(
             interactionID: interaction.id,
             sessionKey: sessionKey,
-            connection: connection
+            connection: connection,
+            bridgeRequestId: event.bridgeRequestId
         )
         pendingBridgeResponsesByInteractionID[interaction.id] = pending
         pendingBridgeResponseIDsByConnection[connection] = interaction.id
         pendingBridgeInteractionIDs.insert(interaction.id)
+        if let bridgeId = event.bridgeRequestId {
+            bridgeRequestIdToInteractionID[bridgeId] = interaction.id
+        }
 
         if interaction.responseMode == .approvalSelection {
             notificationCoordinator.notifyWaitingInput(session: session, interaction: interaction, isBridge: true)
@@ -574,8 +584,57 @@ final class AIAgentManager: ObservableObject {
 
         pendingBridgeResponseIDsByConnection.removeValue(forKey: pending.connection)
         pendingBridgeInteractionIDs.remove(interactionID)
+        if let bridgeId = pending.bridgeRequestId {
+            bridgeRequestIdToInteractionID.removeValue(forKey: bridgeId)
+        }
 
         return pending
+    }
+
+    /// Handle BridgeDropped event — bridge timed out or was disconnected after
+    /// the user handled the approval directly in the CLI.
+    /// Resolve the pending interaction gracefully instead of showing an error state.
+    private func handleBridgeDropped(_ event: AIAgentHookEvent) {
+        // Prefer bridgeRequestId-based matching for precise correlation
+        if let bridgeRequestId = event.bridgeRequestId,
+           let interactionID = bridgeRequestIdToInteractionID[bridgeRequestId],
+           let pending = pendingBridgeResponsesByInteractionID[interactionID] {
+            let sessionKey = pending.sessionKey
+            cleanupPendingBridgeResponse(interactionID)
+
+            if let session = sessionStore.session(forKey: sessionKey) {
+                session.resolveInteraction(
+                    id: interactionID,
+                    state: .submitted("已在终端处理"),
+                    taskOverride: "批准请求已在终端处理",
+                    statusOverride: .thinking
+                )
+                syncSessionsFromStore()
+            }
+            return
+        }
+
+        // Fallback: match by session_id (for older bridge versions without bridgeRequestId)
+        guard let sessionId = event.sessionId else { return }
+        let affectedIDs = pendingBridgeResponsesByInteractionID.compactMap { interactionID, pending -> UUID? in
+            guard let session = sessionStore.session(forKey: pending.sessionKey),
+                  session.sessionId == sessionId else { return nil }
+            return interactionID
+        }
+
+        for interactionID in affectedIDs {
+            guard let pending = pendingBridgeResponsesByInteractionID[interactionID] else { continue }
+            let sessionKey = pending.sessionKey
+            cleanupPendingBridgeResponse(interactionID)
+            guard let session = sessionStore.session(forKey: sessionKey) else { continue }
+            session.resolveInteraction(
+                id: interactionID,
+                state: .submitted("已在终端处理"),
+                taskOverride: "批准请求已在终端处理",
+                statusOverride: .thinking
+            )
+        }
+        syncSessionsFromStore()
     }
 
     private func handleClientDisconnect(connection: AIAgentSocketServer.ClientConnection) {
@@ -594,15 +653,16 @@ final class AIAgentManager: ObservableObject {
                 return
             }
 
-            let message = interactionMessage(in: session, interactionID: interactionID)
-                ?? "Interaction timed out."
+            // Bridge disconnected without receiving a response from Vland.
+            // This means the approval was handled externally (e.g. user approved
+            // directly in the CLI, or the bridge process was terminated).
+            // Resolve gracefully instead of showing an error.
             session.resolveInteraction(
                 id: interactionID,
-                state: .timedOut,
-                taskOverride: "Interaction timed out.",
-                statusOverride: .error
+                state: .submitted("已在终端处理"),
+                taskOverride: "批准请求已在终端处理",
+                statusOverride: .idle
             )
-            notificationCoordinator.notifyInteractionTimeout(session: session, message: message)
             syncSessionsFromStore()
         }
     }
@@ -646,16 +706,16 @@ final class AIAgentManager: ObservableObject {
                 return
             }
 
-            _ = self.sessionStore.removeSession(forKey: sessionKey)
+            _ = self.sessionStore.archiveSession(id: session.id)
             self.transcriptWatcher.unwatch(sessionKey: sessionKey)
             if self.selectedDetailSessionID == session.id {
-                self.selectedDetailSessionID = nil
+                self.isShowingArchivedSessions = true
             }
             self.syncSessionsFromStore()
             self.pendingSessionRemovalItems.removeValue(forKey: sessionKey)
         }
         pendingSessionRemovalItems[sessionKey] = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: item)
     }
 
     func presentSessionDetail(_ session: AIAgentSession) {
@@ -683,9 +743,11 @@ final class AIAgentManager: ObservableObject {
 
     func restoreSession(_ session: AIAgentSession) {
         _ = sessionStore.restoreSession(id: session.id)
+        session.lastActivity = Date()  // Move to top of active list
         if let key = sessionStore.key(forSessionID: session.id) {
             refreshTranscriptWatch(for: session, sessionKey: key)
         }
+        isShowingArchivedSessions = false  // Switch back to active tab
         syncSessionsFromStore()
     }
 
@@ -722,6 +784,7 @@ final class AIAgentManager: ObservableObject {
         let normalized = toolName.lowercased()
         return normalized == "todo_write" || normalized == "todowrite"
             || normalized == "update_plan" || normalized == "updateplan"
+            || normalized == "taskcreate"
     }
 
     private func sessionHasVisibleTaskState(_ session: AIAgentSession) -> Bool {
@@ -770,7 +833,9 @@ final class AIAgentManager: ObservableObject {
         let transcriptPath = session.transcriptPath
         let sessionId = session.sessionId
 
+        #if DEBUG
         NSLog("[Vland] loadFullTranscript: agentType=\(session.agentType.rawValue), transcriptPath=\(transcriptPath ?? "nil"), sessionId=\(sessionId ?? "nil")")
+        #endif
 
         guard let transcriptPath, !transcriptPath.isEmpty else {
             await MainActor.run { session.transcriptLoadError = "No transcript path available" }
@@ -783,14 +848,18 @@ final class AIAgentManager: ObservableObject {
                 transcriptPath: transcriptPath,
                 sessionId: sessionId
             )
+            #if DEBUG
             NSLog("[Vland] loadFullTranscript: loaded \(messages.count) messages")
+            #endif
             await MainActor.run {
                 session.fullTranscript = messages
                 session.isTranscriptLoaded = true
                 session.transcriptLoadError = nil
             }
         } catch {
+            #if DEBUG
             NSLog("[Vland] loadFullTranscript: error=\(error.localizedDescription)")
+            #endif
             await MainActor.run {
                 session.transcriptLoadError = error.localizedDescription
             }
@@ -800,8 +869,7 @@ final class AIAgentManager: ObservableObject {
     // MARK: - Stale Session Cleanup
 
     private func startStaleSessionCleanup() {
-        staleSessionTimer?.invalidate()
-        staleSessionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+        BackgroundTaskCoordinator.shared.register { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
                 self.cleanupStaleSessions()

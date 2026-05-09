@@ -252,9 +252,7 @@ private struct SingleAgentSneakPeekContent: View {
             )
 
             HStack(alignment: .center, spacing: 6) {
-                Image(systemName: session.agentType.iconName)
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundStyle(session.agentType.accentColor)
+                AgentTypeIconView(agentType: session.agentType, size: 10)
 
                 Text(titleText)
                     .font(.system(size: 9, weight: .medium))
@@ -322,9 +320,7 @@ private struct MultiAgentSneakPeekRow: View {
 
     var body: some View {
         HStack(spacing: 4) {
-            Image(systemName: session.agentType.iconName)
-                .font(.system(size: 6, weight: .semibold))
-                .foregroundStyle(session.agentType.accentColor)
+            AgentTypeIconView(agentType: session.agentType, size: 8)
                 .frame(width: 8, alignment: .center)
 
             AIAgentSegmentedProgressBar(
@@ -361,9 +357,7 @@ private struct AIAgentSneakPeekAgentBadge: View {
                     .frame(width: size * 0.68, height: size * 0.68)
                     .clipShape(RoundedRectangle(cornerRadius: max(2, size * 0.24), style: .continuous))
             } else {
-                Image(systemName: agentType.iconName)
-                    .font(.system(size: size * 0.46, weight: .semibold))
-                    .foregroundStyle(tint)
+                AgentTypeIconView(agentType: agentType, size: size * 0.6)
             }
         }
         .frame(width: size, height: size)

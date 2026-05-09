@@ -763,9 +763,7 @@ struct HomeAIAgentBar: View {
                                 .fill(session.agentType.accentColor.opacity(0.15))
                                 .frame(width: 20, height: 20)
 
-                            Image(systemName: session.agentType.iconName)
-                                .font(.system(size: 9, weight: .semibold))
-                                .foregroundColor(session.agentType.accentColor)
+                            AgentTypeIconView(agentType: session.agentType, size: 12)
                         }
 
                         VStack(alignment: .leading, spacing: 1) {

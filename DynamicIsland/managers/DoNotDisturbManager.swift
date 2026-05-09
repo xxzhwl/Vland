@@ -45,6 +45,7 @@ final class DoNotDisturbManager: ObservableObject {
     private let assertionsURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/DoNotDisturb/DB/Assertions.json")
     private var pollingSource: DispatchSourceTimer?
+    private var fileEventSource: DispatchSourceFileSystemObject?
     private var lastAssertionsModificationDate: Date?
     private var modeCancellable: AnyCancellable?
     /// Periodic task that verifies focus is still active when `isDoNotDisturbActive` is true.
@@ -573,18 +574,39 @@ private extension DoNotDisturbManager {
         stopAssertionsPolling()
         lastAssertionsModificationDate = nil
 
-        let timer = DispatchSource.makeTimerSource(queue: pollingQueue)
-        timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(2), leeway: .milliseconds(250))
-        timer.setEventHandler { [weak self] in
+        let fd = open(assertionsURL.path, O_EVTONLY)
+        guard fd >= 0 else {
+            // Fall back to timer-based polling if file can't be opened
+            let timer = DispatchSource.makeTimerSource(queue: pollingQueue)
+            timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(2), leeway: .milliseconds(250))
+            timer.setEventHandler { [weak self] in
+                self?.pollAssertionsState()
+            }
+            timer.resume()
+            pollingSource = timer
+            return
+        }
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .extend, .rename, .delete],
+            queue: pollingQueue
+        )
+        source.setEventHandler { [weak self] in
             self?.pollAssertionsState()
         }
-        timer.resume()
-        pollingSource = timer
+        source.setCancelHandler {
+            close(fd)
+        }
+        source.resume()
+        fileEventSource = source
     }
 
     func stopAssertionsPolling() {
         pollingSource?.cancel()
         pollingSource = nil
+        fileEventSource?.cancel()
+        fileEventSource = nil
         lastAssertionsModificationDate = nil
     }
 

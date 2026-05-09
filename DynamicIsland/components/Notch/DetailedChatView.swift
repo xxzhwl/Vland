@@ -27,6 +27,7 @@ struct DetailedChatView: View {
     @Default(.aiAgentShowThinkingBlocks) private var showThinkingBlocks
     @Default(.aiAgentShowToolDetails) private var showToolDetails
     @Default(.aiAgentShowToolOutput) private var showToolOutput
+    @State private var cachedSegments: [ChatSegment] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -42,6 +43,62 @@ struct DetailedChatView: View {
                 loadingView
             }
         }
+        .onChange(of: session.fullTranscript) { _, newTranscript in
+            cachedSegments = buildChatSegments(from: newTranscript)
+        }
+        .onAppear {
+            if cachedSegments.isEmpty, !session.fullTranscript.isEmpty {
+                cachedSegments = buildChatSegments(from: session.fullTranscript)
+            }
+        }
+    }
+
+    /// Build chat segments from transcript messages (non-body computation)
+    private func buildChatSegments(from transcript: [TranscriptMessage]) -> [ChatSegment] {
+        var segments: [ChatSegment] = []
+        var currentUserMessage: TranscriptMessage?
+        var currentAssistantMessages: [TranscriptMessage] = []
+
+        for message in transcript {
+            switch message.role {
+            case .user:
+                if let userMsg = currentUserMessage, hasValidTextContent(userMsg), !currentAssistantMessages.isEmpty {
+                    segments.append(ChatSegment(
+                        id: userMsg.id,
+                        userMessage: userMsg,
+                        assistantMessages: currentAssistantMessages
+                    ))
+                }
+                currentUserMessage = message
+                currentAssistantMessages = []
+
+            case .assistant:
+                currentAssistantMessages.append(message)
+
+            case .system, .tool:
+                if currentUserMessage != nil {
+                    currentAssistantMessages.append(message)
+                } else if let lastSegment = segments.last {
+                    var updatedSegment = lastSegment
+                    updatedSegment.assistantMessages.append(message)
+                    segments[segments.count - 1] = updatedSegment
+                }
+            }
+        }
+
+        if let userMsg = currentUserMessage, hasValidTextContent(userMsg) {
+            segments.append(ChatSegment(
+                id: userMsg.id,
+                userMessage: userMsg,
+                assistantMessages: currentAssistantMessages
+            ))
+        } else if !currentAssistantMessages.isEmpty, let lastSegment = segments.last {
+            var updatedSegment = lastSegment
+            updatedSegment.assistantMessages.append(contentsOf: currentAssistantMessages)
+            segments[segments.count - 1] = updatedSegment
+        }
+
+        return segments
     }
 
     // MARK: - Transcript List with Chat-like Layout
@@ -50,7 +107,7 @@ struct DetailedChatView: View {
         ScrollViewReader { proxy in
             ScrollView(.vertical, showsIndicators: false) {
                 LazyVStack(alignment: .leading, spacing: 10) {
-                    ForEach(chatSegments) { segment in
+                    ForEach(cachedSegments) { segment in
                         ChatSegmentView(
                             segment: segment,
                             agentType: session.agentType,
@@ -59,6 +116,7 @@ struct DetailedChatView: View {
                             showToolDetails: showToolDetails,
                             showToolOutput: showToolOutput
                         )
+                        .equatable()
                         .id(segment.id)
                     }
                 }
@@ -68,7 +126,7 @@ struct DetailedChatView: View {
             .onAppear {
                 scrollToLatestChat(proxy: proxy)
             }
-            .onChange(of: session.fullTranscript.count) { _, _ in
+            .onChange(of: cachedSegments.count) { _, _ in
                 scrollToLatestChat(proxy: proxy)
             }
         }
@@ -86,65 +144,8 @@ struct DetailedChatView: View {
         }
     }
 
-    /// 将 transcript 消息分组为用户-AI 对话的片段
-    /// 每个片段包含一个有效的用户消息和其对应的 AI 回复
-    private var chatSegments: [ChatSegment] {
-        var segments: [ChatSegment] = []
-        var currentUserMessage: TranscriptMessage?
-        var currentAssistantMessages: [TranscriptMessage] = []
-
-        for message in session.fullTranscript {
-            switch message.role {
-            case .user:
-                // 保存之前的片段（只有当用户消息有有效内容时才保存）
-                if let userMsg = currentUserMessage, hasValidTextContent(userMsg), !currentAssistantMessages.isEmpty {
-                    segments.append(ChatSegment(
-                        id: userMsg.id,
-                        userMessage: userMsg,
-                        assistantMessages: currentAssistantMessages
-                    ))
-                }
-                // 开始新的片段（不管用户消息是否有内容）
-                currentUserMessage = message
-                currentAssistantMessages = []
-
-            case .assistant:
-                currentAssistantMessages.append(message)
-
-            case .system, .tool:
-                // 系统和工具消息附加到当前片段的 assistant 消息中
-                if currentUserMessage != nil {
-                    currentAssistantMessages.append(message)
-                } else if let lastSegment = segments.last {
-                    // 附加到最后一个片段
-                    var updatedSegment = lastSegment
-                    updatedSegment.assistantMessages.append(message)
-                    segments[segments.count - 1] = updatedSegment
-                }
-                // 如果没有任何片段，忽略这些消息
-
-            }
-        }
-
-        // 保存最后一个片段（只有当用户消息有有效内容时才保存）
-        if let userMsg = currentUserMessage, hasValidTextContent(userMsg) {
-            segments.append(ChatSegment(
-                id: userMsg.id,
-                userMessage: userMsg,
-                assistantMessages: currentAssistantMessages
-            ))
-        } else if !currentAssistantMessages.isEmpty, let lastSegment = segments.last {
-            // 如果最后的用户消息没有有效内容，但有 assistant 消息，附加到前一个片段
-            var updatedSegment = lastSegment
-            updatedSegment.assistantMessages.append(contentsOf: currentAssistantMessages)
-            segments[segments.count - 1] = updatedSegment
-        }
-
-        return segments
-    }
-
     private func scrollToLatestChat(proxy: ScrollViewProxy) {
-        if let lastSegment = chatSegments.last {
+        if let lastSegment = cachedSegments.last {
             withAnimation(.easeOut(duration: 0.3)) {
                 proxy.scrollTo(lastSegment.id, anchor: .bottom)
             }
@@ -154,28 +155,38 @@ struct DetailedChatView: View {
     // MARK: - Empty / Loading / Error
 
     private var emptyTranscriptView: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 8) {
             Image(systemName: "text.bubble")
-                .font(.system(size: style.scaled(20)))
-                .foregroundColor(.gray.opacity(0.5))
+                .font(.system(size: style.scaled(22)))
+                .foregroundColor(.gray.opacity(0.35))
+                .symbolEffect(.pulse, options: .repeating)
+
             Text("暂无对话记录")
-                .font(.system(size: style.scaled(10)))
-                .foregroundColor(.gray.opacity(0.6))
+                .font(.system(size: style.scaled(10.5), weight: .medium))
+                .foregroundColor(.gray.opacity(0.55))
+
+            Text("会话产生对话后，完整记录将自动显示在此处")
+                .font(.system(size: style.scaled(8.5)))
+                .foregroundColor(.gray.opacity(0.42))
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(.vertical, 20)
+        .padding(.vertical, 24)
     }
 
     private var loadingView: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 10) {
             ProgressView()
                 .controlSize(.small)
+                .tint(.gray.opacity(0.6))
+
             Text("加载对话记录...")
                 .font(.system(size: style.scaled(10)))
-                .foregroundColor(.gray.opacity(0.6))
+                .foregroundColor(.gray.opacity(0.55))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(.vertical, 20)
+        .padding(.vertical, 24)
     }
 
     private func transcriptErrorView(_ error: String) -> some View {
@@ -259,10 +270,23 @@ struct TranscriptMessageRow: View {
             }
             .padding(.leading, 17)
         }
-        .padding(6)
+        .padding(8)
         .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(roleBackgroundColor)
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        gradient: Gradient(colors: [
+                            roleBackgroundColor,
+                            roleBackgroundColor.opacity(0.5)
+                        ]),
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(roleBackgroundColor.opacity(0.5), lineWidth: 0.5)
         )
     }
 
@@ -397,16 +421,7 @@ struct TranscriptMessageRow: View {
                     .font(.system(size: style.scaled(8)))
                     .foregroundColor(.white.opacity(0.4))
             case .assistant:
-                if let image = AIAgentIconResolver.image(for: agentType) {
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
-                } else {
-                    Image(systemName: agentType.iconName)
-                        .font(.system(size: style.scaled(8)))
-                        .foregroundColor(agentType.accentColor.opacity(0.6))
-                }
+                AgentTypeIconView(agentType: agentType, size: style.scaled(10))
             case .system:
                 Image(systemName: "gearshape.fill")
                     .font(.system(size: style.scaled(8)))
@@ -449,7 +464,7 @@ struct TranscriptMessageRow: View {
 
 // MARK: - Chat Segment (User + AI responses)
 
-struct ChatSegment: Identifiable {
+struct ChatSegment: Identifiable, Equatable {
     let id: String
     let userMessage: TranscriptMessage
     var assistantMessages: [TranscriptMessage]
@@ -457,13 +472,20 @@ struct ChatSegment: Identifiable {
 
 // MARK: - Chat Segment View
 
-struct ChatSegmentView: View {
+struct ChatSegmentView: View, Equatable {
     let segment: ChatSegment
     let agentType: AIAgentType
     let style: AIAgentCardStyle
     let showThinkingBlocks: Bool
     let showToolDetails: Bool
     let showToolOutput: Bool
+
+    static func == (lhs: ChatSegmentView, rhs: ChatSegmentView) -> Bool {
+        lhs.segment.id == rhs.segment.id
+            && lhs.showThinkingBlocks == rhs.showThinkingBlocks
+            && lhs.showToolDetails == rhs.showToolDetails
+            && lhs.showToolOutput == rhs.showToolOutput
+    }
 
     @State private var isExpanded = true
 
@@ -491,10 +513,9 @@ struct ChatSegmentView: View {
 
     private var userBubble: some View {
         HStack(alignment: .top, spacing: 0) {
-            Spacer(minLength: 40)  // Push to right side
+            Spacer(minLength: 40)
 
             VStack(alignment: .trailing, spacing: 4) {
-                // Timestamp + avatar
                 HStack(spacing: 5) {
                     if let timestamp = segment.userMessage.timestamp {
                         Text(formatTimestamp(timestamp))
@@ -508,22 +529,30 @@ struct ChatSegmentView: View {
                         .background(Circle().fill(Color.white.opacity(0.12)))
                 }
 
-                // Message content in bubble (使用 displayContent 过滤系统注入内容)
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(Array(segment.userMessage.displayContent.enumerated()), id: \.offset) { _, block in
                         userContentBlockView(block)
                     }
                 }
                 .lineSpacing(2)
-                .padding(.horizontal, 10)
+                .padding(.horizontal, 12)
                 .padding(.vertical, 8)
                 .background(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(Color.white.opacity(0.1))
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                gradient: Gradient(colors: [
+                                    Color.white.opacity(0.12),
+                                    Color.white.opacity(0.06)
+                                ]),
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
                 )
                 .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(Color.white.opacity(0.08), lineWidth: 0.5)
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.1), lineWidth: 0.5)
                 )
             }
         }
@@ -534,10 +563,8 @@ struct ChatSegmentView: View {
     private var aiBubble: some View {
         HStack(alignment: .top, spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
-                // Agent header with collapse button
                 HStack(spacing: 5) {
-                    AgentIconView(agentType: agentType, size: 16)
-                        .frame(width: 16, height: 16)
+                    AgentTypeIconView(agentType: agentType, size: 16)
 
                     Text(agentType.displayName)
                         .font(.system(size: style.scaled(10), weight: .semibold))
@@ -545,7 +572,6 @@ struct ChatSegmentView: View {
 
                     Spacer()
 
-                    // Collapse button with rotation animation
                     Button {
                         withAnimation(.spring(response: 0.3)) {
                             isExpanded.toggle()
@@ -560,24 +586,32 @@ struct ChatSegmentView: View {
                 }
                 .padding(.bottom, 6)
 
-                // All assistant messages merged in one bubble
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(segment.assistantMessages) { message in
                         messageContentView(message)
                     }
                 }
                 .lineSpacing(2)
-                .padding(10)
+                .padding(12)
                 .background(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(accentColor.opacity(0.05))
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                gradient: Gradient(colors: [
+                                    accentColor.opacity(0.08),
+                                    accentColor.opacity(0.03)
+                                ]),
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
                 )
                 .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(accentColor.opacity(0.1), lineWidth: 0.5)
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(accentColor.opacity(0.12), lineWidth: 0.5)
                 )
             }
-            .padding(.trailing, 20)  // Right padding to prevent full-width
+            .padding(.trailing, 20)
         }
     }
 
@@ -585,8 +619,7 @@ struct ChatSegmentView: View {
 
     private var collapsedPreview: some View {
         HStack(spacing: 6) {
-            AgentIconView(agentType: agentType, size: 12)
-                .foregroundColor(accentColor.opacity(0.7))
+            AgentTypeIconView(agentType: agentType, size: 12)
 
             Text("\(segment.assistantMessages.count) 条回复")
                 .font(.system(size: style.scaled(9)))
@@ -755,36 +788,454 @@ struct ChatSegmentView: View {
     }
 }
 
-struct AgentIconView: View {
-    let agentType: AIAgentType
-    let size: CGFloat
+typealias AgentIconView = AgentTypeIconView
+
+// MARK: - Unified Conversation View
+
+/// A natural conversation view that shows user ↔ AI exchanges.
+/// Tool calls and thinking blocks are collapsed by default — tap to expand.
+struct UnifiedConversationView: View {
+    @ObservedObject var session: AIAgentSession
+    let style: AIAgentCardStyle
+    @ObservedObject var agentManager: AIAgentManager
+    @Default(.aiAgentShowThinkingBlocks) private var showThinkingBlocks
+    @Default(.aiAgentShowToolDetails) private var showToolDetails
+    @Default(.aiAgentShowToolOutput) private var showToolOutput
 
     var body: some View {
-        if let image = AIAgentIconResolver.image(for: agentType) {
-            Image(nsImage: image)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(width: size, height: size)
-                .clipShape(RoundedRectangle(cornerRadius: 2, style: .continuous))
-        } else {
-            Image(systemName: agentType.iconName)
-                .font(.system(size: size, weight: .semibold))
-                .foregroundColor(agentType.accentColor)
+        ScrollView(.vertical, showsIndicators: false) {
+            LazyVStack(alignment: .leading, spacing: 8) {
+                // Pending interaction (already shown in expandedContent, but keep for scroll continuity)
+                // Subagents
+                if !session.subagentToolCalls.isEmpty {
+                    SubagentCompactSection(toolCalls: session.subagentToolCalls, style: style)
+                }
+
+                // Structured subtasks
+                if !session.structuredSubtasks.isEmpty {
+                    TasksCompactSection(tasks: session.structuredSubtasks, accentColor: accentColor, style: style)
+                }
+
+                if session.conversationTurns.isEmpty {
+                    // No conversation yet — show recent event log
+                    recentActivitySummary
+                } else {
+                    ForEach(session.conversationTurns) { turn in
+                        UnifiedTurnView(
+                            turn: turn,
+                            agentType: session.agentType,
+                            style: style,
+                            accentColor: accentColor,
+                            showThinkingBlocks: showThinkingBlocks,
+                            showToolDetails: showToolDetails,
+                            showToolOutput: showToolOutput
+                        )
+                    }
+                }
+            }
+            .padding(10)
         }
+    }
+
+    private var accentColor: Color {
+        style.accentColor(for: session.agentType)
+    }
+
+    private var recentActivitySummary: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            ForEach(session.eventLog.suffix(10).reversed()) { entry in
+                HStack(alignment: .top, spacing: 6) {
+                    Text(entry.timeString)
+                        .font(.system(size: style.scaled(8), design: .monospaced))
+                        .foregroundColor(.gray.opacity(0.4))
+                        .frame(width: 45, alignment: .leading)
+
+                    Circle()
+                        .fill(colorForHookType(entry.hookType))
+                        .frame(width: 4, height: 4)
+                        .padding(.top, 4)
+
+                    Text(entry.description)
+                        .font(.system(size: style.scaled(9)))
+                        .foregroundColor(.gray.opacity(0.65))
+                        .lineLimit(2)
+                }
+            }
+        }
+    }
+
+    private func colorForHookType(_ type: String) -> Color {
+        switch type {
+        case "UserPromptSubmit": return .blue
+        case "PreToolUse": return .cyan
+        case "PostToolUse": return .green
+        case "Stop": return .orange
+        case "SessionStart": return .green
+        case "SessionEnd": return .red
+        default: return .gray
+        }
+    }
+}
+
+// MARK: - Unified Turn View
+
+/// A single user → AI exchange in the conversation.
+/// User message is right-aligned; AI response is left-aligned with avatar.
+struct UnifiedTurnView: View {
+    @ObservedObject var turn: AIAgentConversationTurn
+    let agentType: AIAgentType
+    let style: AIAgentCardStyle
+    let accentColor: Color
+    let showThinkingBlocks: Bool
+    let showToolDetails: Bool
+    let showToolOutput: Bool
+
+    @State private var toolCallsExpanded = false
+    @State private var thinkingExpanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            // User message (right-aligned) — only show when there's real user content
+            if !turn.userPrompt.isEmpty {
+                userBubble
+            }
+
+            // AI response area (left-aligned with avatar)
+            VStack(alignment: .leading, spacing: 6) {
+                // Agent header
+                HStack(spacing: 5) {
+                    AgentTypeIconView(agentType: agentType, size: style.scaled(12))
+                    Text(agentType.displayName)
+                        .font(.system(size: style.scaled(9), weight: .semibold))
+                        .foregroundColor(accentColor.opacity(0.85))
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    // Agent response text (always visible)
+                    if let response = turn.agentResponse, !response.isEmpty {
+                        Text(markdownAttributedString(response))
+                            .font(.system(size: style.scaled(10)))
+                            .foregroundColor(.white.opacity(0.82))
+                            .textSelection(.enabled)
+                    } else if !turn.isComplete {
+                        // Still processing
+                        HStack(spacing: 4) {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .scaleEffect(0.7)
+                            Text("AI 回复中...")
+                                .font(.system(size: style.scaled(9)))
+                                .foregroundColor(.gray.opacity(0.55))
+                        }
+                    }
+
+                    // Tool calls — collapsed by default
+                    if !turn.toolCalls.isEmpty {
+                        toolCallsSection
+                    }
+                }
+                .padding(10)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(accentColor.opacity(0.05))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(accentColor.opacity(0.08), lineWidth: 0.5)
+                )
+            }
+            .padding(.trailing, 24)
+        }
+    }
+
+    // MARK: - User Bubble
+
+    private var userBubble: some View {
+        HStack(alignment: .top, spacing: 0) {
+            Spacer(minLength: 40)
+            VStack(alignment: .trailing, spacing: 3) {
+                HStack(spacing: 5) {
+                    Text(turn.timeString)
+                        .font(.system(size: style.scaled(7.5), design: .monospaced))
+                        .foregroundColor(.gray.opacity(0.45))
+                    Image(systemName: "person.fill")
+                        .font(.system(size: style.scaled(7)))
+                        .frame(width: 14, height: 14)
+                        .background(Circle().fill(Color.white.opacity(0.1)))
+                }
+                Text(turn.userPrompt)
+                    .font(.system(size: style.scaled(10), weight: .medium))
+                    .foregroundColor(.white.opacity(0.9))
+                    .lineLimit(4)
+                    .textSelection(.enabled)
+                    .lineSpacing(2)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Color.white.opacity(0.08))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.06), lineWidth: 0.5)
+                    )
+            }
+            .frame(maxWidth: style.fontScale > 1 ? 360 : 280, alignment: .trailing)
+        }
+    }
+
+    // MARK: - Tool Calls (Expandable)
+
+    private var toolCallsSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            // Collapsed indicator — always visible
+            Button(action: {
+                withAnimation(.spring(response: 0.3)) {
+                    toolCallsExpanded.toggle()
+                }
+            }) {
+                HStack(spacing: 5) {
+                    Image(systemName: toolCallsExpanded ? "gearshape.2.fill" : "gearshape.fill")
+                        .font(.system(size: style.scaled(8)))
+                        .foregroundColor(.cyan.opacity(0.7))
+
+                    Text(toolCallsExpanded ? "隐藏工具详情" : "执行了 \(turn.toolCalls.count) 个操作")
+                        .font(.system(size: style.scaled(8.5), weight: .medium))
+                        .foregroundColor(.cyan.opacity(0.8))
+
+                    Spacer()
+
+                    Text(toolCallsExpanded ? "收起" : "详情")
+                        .font(.system(size: style.scaled(8)))
+                        .foregroundColor(.gray.opacity(0.5))
+
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: style.scaled(7)))
+                        .foregroundColor(.gray.opacity(0.4))
+                        .rotationEffect(.degrees(toolCallsExpanded ? 180 : 0))
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.cyan.opacity(0.06))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(Color.cyan.opacity(0.12), lineWidth: 0.5)
+                )
+            }
+            .buttonStyle(.plain)
+
+            // Expanded tool details
+            if toolCallsExpanded {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(turn.toolCalls) { call in
+                        HStack(spacing: 5) {
+                            Image(systemName: call.output != nil ? "checkmark.circle.fill" : "ellipsis.circle.fill")
+                                .font(.system(size: style.scaled(7)))
+                                .foregroundColor(call.output != nil ? .green.opacity(0.6) : .yellow.opacity(0.6))
+
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(call.displayDescription)
+                                    .font(.system(size: style.scaled(9), design: .monospaced))
+                                    .foregroundColor(.white.opacity(0.7))
+                                    .lineLimit(1)
+
+                                if showToolOutput, let output = call.output, !output.isEmpty {
+                                    Text(output.prefix(120))
+                                        .font(.system(size: style.scaled(8)))
+                                        .foregroundColor(.gray.opacity(0.5))
+                                        .lineLimit(2)
+                                }
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+                .padding(.leading, 8)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+    }
+}
+
+// MARK: - Compact Subagent Section
+
+private struct SubagentCompactSection: View {
+    let toolCalls: [AIAgentToolCall]
+    let style: AIAgentCardStyle
+    @State private var isExpanded = false
+
+    private var activeCount: Int {
+        toolCalls.filter { $0.output == nil }.count
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Button(action: {
+                withAnimation(.spring(response: 0.3)) { isExpanded.toggle() }
+            }) {
+                HStack(spacing: 6) {
+                    Image(systemName: "square.stack.3d.up.fill")
+                        .font(.system(size: style.scaled(8)))
+                        .foregroundColor(.purple.opacity(0.8))
+
+                    Text(activeCount > 0
+                         ? "子代理运行中 \(activeCount)/\(toolCalls.count) 个"
+                         : "子代理 \(toolCalls.count) 个")
+                        .font(.system(size: style.scaled(9), weight: .semibold))
+                        .foregroundColor(.purple.opacity(0.8))
+
+                    Spacer()
+
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: style.scaled(7)))
+                        .foregroundColor(.gray.opacity(0.4))
+                        .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                }
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(toolCalls) { call in
+                        HStack(spacing: 6) {
+                            Image(systemName: call.output == nil ? "ellipsis.circle.fill" : "checkmark.circle.fill")
+                                .font(.system(size: style.scaled(8)))
+                                .foregroundColor(call.output == nil ? .yellow.opacity(0.7) : .green.opacity(0.75))
+
+                            Text(call.displayDescription)
+                                .font(.system(size: style.scaled(9.5)))
+                                .foregroundColor(.white.opacity(0.72))
+                                .lineLimit(2)
+                        }
+                    }
+                }
+                .padding(.leading, 14)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(Color.purple.opacity(0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .strokeBorder(Color.purple.opacity(0.14), lineWidth: 0.5)
+        )
+    }
+}
+
+// MARK: - Compact Tasks Section
+
+private struct TasksCompactSection: View {
+    let tasks: [AIAgentSubtask]
+    let accentColor: Color
+    let style: AIAgentCardStyle
+    @State private var isExpanded = false
+
+    private var activeCount: Int {
+        tasks.filter { $0.status.isActive }.count
+    }
+
+    private var completedCount: Int {
+        tasks.filter { $0.status == .completed }.count
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Button(action: {
+                withAnimation(.spring(response: 0.3)) { isExpanded.toggle() }
+            }) {
+                HStack(spacing: 6) {
+                    Image(systemName: "checklist")
+                        .font(.system(size: style.scaled(8)))
+                        .foregroundColor(accentColor.opacity(0.85))
+
+                    Text(activeCount > 0
+                         ? "任务进行中 \(completedCount)/\(tasks.count)"
+                         : "任务 \(tasks.count)")
+                        .font(.system(size: style.scaled(9), weight: .semibold))
+                        .foregroundColor(accentColor.opacity(0.85))
+
+                    Spacer(minLength: 4)
+
+                    Text("\(completedCount)/\(tasks.count)")
+                        .font(.system(size: style.scaled(8), weight: .medium, design: .monospaced))
+                        .foregroundColor(.gray.opacity(0.6))
+
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: style.scaled(7)))
+                        .foregroundColor(.gray.opacity(0.4))
+                        .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                }
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(tasks) { task in
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                Image(systemName: task.status.iconName)
+                                    .font(.system(size: style.scaled(8)))
+                                    .foregroundColor(task.status.color.opacity(0.85))
+                                    .frame(width: 10, alignment: .center)
+
+                                Text(task.title)
+                                    .font(.system(size: style.scaled(9.5)))
+                                    .foregroundColor(.white.opacity(task.status == .completed ? 0.58 : 0.8))
+                                    .lineLimit(2)
+                                    .strikethrough(task.status == .completed)
+                            }
+                            if let subtitle = task.subtitleText {
+                                Text(subtitle)
+                                    .font(.system(size: style.scaled(8.5)))
+                                    .foregroundColor(.gray.opacity(0.55))
+                                    .lineLimit(2)
+                                    .padding(.leading, 16)
+                            }
+                        }
+                    }
+                }
+                .padding(.leading, 14)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(accentColor.opacity(0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .strokeBorder(accentColor.opacity(0.14), lineWidth: 0.5)
+        )
     }
 }
 
 // MARK: - Markdown Rendering Helper
 
-/// Parse markdown text into AttributedString for native rendering
+/// Cache for parsed AttributedString results to avoid repeated markdown parsing.
+private let mdCache = NSCache<NSString, NSAttributedString>()
+
 private func markdownAttributedString(_ markdown: String) -> AttributedString {
+    if let cached = mdCache.object(forKey: markdown as NSString) {
+        return AttributedString(cached)
+    }
     do {
         var attributed = try AttributedString(
             markdown: markdown,
             options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         )
+        // Cache the NSAttributedString representation
+        mdCache.setObject(NSAttributedString(attributed), forKey: markdown as NSString)
         return attributed
     } catch {
-        return AttributedString(markdown)
+        let fallback = AttributedString(markdown)
+        mdCache.setObject(NSAttributedString(fallback), forKey: markdown as NSString)
+        return fallback
     }
 }

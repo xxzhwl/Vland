@@ -217,7 +217,7 @@ final class ClipboardManager: ObservableObject {
         guard !isMonitoring else { return }
         
         isMonitoring = true
-        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.checkClipboard()
         }
     }
@@ -478,6 +478,7 @@ final class ClipboardManager: ObservableObject {
             }
             
             self.saveHistoryToDefaults()
+            self.performDiskCleanupIfNeeded()
         }
     }
     
@@ -500,17 +501,53 @@ final class ClipboardManager: ObservableObject {
         }
     }
     
+    private static let maxClipboardDiskBytes: UInt64 = 500 * 1024 * 1024 // 500MB
+
     // Clean up old image files that are no longer referenced
     private func cleanupOldFiles() {
         guard let files = try? FileManager.default.contentsOfDirectory(at: ClipboardManager.clipboardDataDirectory, includingPropertiesForKeys: nil) else { return }
-        
+
         let referencedFiles = Set(clipboardHistory.compactMap { $0.imageFileName })
-        
+
         for file in files {
             let fileName = file.lastPathComponent
             if !referencedFiles.contains(fileName) {
                 try? FileManager.default.removeItem(at: file)
             }
+        }
+    }
+
+    private func performDiskCleanupIfNeeded() {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: ClipboardManager.clipboardDataDirectory,
+            includingPropertiesForKeys: [.fileSizeKey, .creationDateKey]
+        ) else { return }
+
+        let totalSize: UInt64 = files.reduce(0) { sum, file in
+            let attrs = try? file.resourceValues(forKeys: [.fileSizeKey])
+            return sum + UInt64(attrs?.fileSize ?? 0)
+        }
+
+        guard totalSize > Self.maxClipboardDiskBytes, clipboardHistory.count > 1 else { return }
+
+        let sorted = clipboardHistory
+            .filter { $0.imageFileName != nil }
+            .sorted { $0.timestamp < $1.timestamp }
+
+        var removedSize: UInt64 = 0
+        let target = totalSize - Self.maxClipboardDiskBytes + (50 * 1024 * 1024) // remove excess + 50MB buffer
+        for item in sorted {
+            guard removedSize < target, let fileName = item.imageFileName else { break }
+            let fileURL = ClipboardManager.clipboardDataDirectory.appendingPathComponent(fileName)
+            if let attrs = try? fileURL.resourceValues(forKeys: [.fileSizeKey]),
+               let fileSize = attrs.fileSize {
+                removedSize += UInt64(fileSize)
+            }
+            try? FileManager.default.removeItem(at: fileURL)
+            clipboardHistory.removeAll { $0.id == item.id }
+        }
+        if !sorted.isEmpty {
+            saveHistoryToDefaults()
         }
     }
     

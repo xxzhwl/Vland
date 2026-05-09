@@ -66,7 +66,7 @@ struct AIAgentCardTheme: Codable, Defaults.Serializable {
     var progressBarCornerRadius: CGFloat?
     var progressBarBackgroundOpacity: Double?
 
-    // MARK: - 6 Presets
+    // MARK: - Presets
 
     static let defaultTheme = AIAgentCardTheme()
 
@@ -88,86 +88,6 @@ struct AIAgentCardTheme: Codable, Defaults.Serializable {
         progressBarHeight: 3,
         progressBarCornerRadius: 1.5,
         progressBarBackgroundOpacity: 0.08
-    )
-
-    static let vivid = AIAgentCardTheme(
-        cardBackgroundOpacity: 0.12,
-        cardBorderOpacity: 0.5,
-        textPrimaryOpacity: 1.0,
-        textSecondaryOpacity: 0.9,
-        textTertiaryOpacity: 0.6,
-        fontDesign: .default,
-        cardCornerRadius: 14,
-        cardPaddingH: 14,
-        cardPaddingV: 10,
-        innerSpacing: 6,
-        sectionSpacing: 8,
-        interactionBackgroundOpacity: 0.12,
-        interactionBorderOpacity: 0.3,
-        optionCornerRadius: 8,
-        progressBarHeight: 6,
-        progressBarCornerRadius: 3,
-        progressBarBackgroundOpacity: 0.2
-    )
-
-    static let monochrome = AIAgentCardTheme(
-        cardBackgroundOpacity: 0.05,
-        cardBorderOpacity: 0.2,
-        textPrimaryOpacity: 0.85,
-        textSecondaryOpacity: 0.6,
-        textTertiaryOpacity: 0.35,
-        fontDesign: .monospaced,
-        cardCornerRadius: 6,
-        cardPaddingH: 10,
-        cardPaddingV: 8,
-        innerSpacing: 4,
-        sectionSpacing: 6,
-        interactionBackgroundOpacity: 0.05,
-        interactionBorderOpacity: 0.12,
-        optionCornerRadius: 4,
-        progressBarHeight: 4,
-        progressBarCornerRadius: 2,
-        progressBarBackgroundOpacity: 0.1
-    )
-
-    static let neon = AIAgentCardTheme(
-        cardBackgroundOpacity: 0.08,
-        cardBorderOpacity: 0.7,
-        textPrimaryOpacity: 0.95,
-        textSecondaryOpacity: 0.8,
-        textTertiaryOpacity: 0.5,
-        fontDesign: .default,
-        cardCornerRadius: 12,
-        cardPaddingH: 12,
-        cardPaddingV: 9,
-        innerSpacing: 5,
-        sectionSpacing: 7,
-        interactionBackgroundOpacity: 0.08,
-        interactionBorderOpacity: 0.25,
-        optionCornerRadius: 7,
-        progressBarHeight: 5,
-        progressBarCornerRadius: 2.5,
-        progressBarBackgroundOpacity: 0.15
-    )
-
-    static let terminal = AIAgentCardTheme(
-        cardBackgroundOpacity: 0.02,
-        cardBorderOpacity: 0.15,
-        textPrimaryOpacity: 0.9,
-        textSecondaryOpacity: 0.7,
-        textTertiaryOpacity: 0.4,
-        fontDesign: .monospaced,
-        cardCornerRadius: 4,
-        cardPaddingH: 8,
-        cardPaddingV: 6,
-        innerSpacing: 3,
-        sectionSpacing: 5,
-        interactionBackgroundOpacity: 0.02,
-        interactionBorderOpacity: 0.1,
-        optionCornerRadius: 3,
-        progressBarHeight: 3,
-        progressBarCornerRadius: 1,
-        progressBarBackgroundOpacity: 0.06
     )
 }
 

@@ -23,9 +23,10 @@ import sys
 import time
 import argparse
 import hashlib
+import uuid
 from datetime import datetime
 
-VLAND_BRIDGE_VERSION = "2026.05.07.1"
+VLAND_BRIDGE_VERSION = "2026.05.09.1"
 
 SOCKET_PATH = os.path.join(os.environ.get("TMPDIR", "/tmp"), "vland-ai-agent.sock")
 
@@ -625,10 +626,10 @@ def extract_tool_input_summary(stdin_data):
                      or tool_input.get("target_file") or tool_input.get("path")
                      or tool_input.get("target_directory"))
 
-        if tool_name in ("task", "agent"):
-            subtask = (tool_input.get("description") or tool_input.get("prompt")
-                       or tool_input.get("title") or tool_input.get("task")
-                       or tool_input.get("message"))
+        if tool_name in ("task", "agent", "taskcreate"):
+            subtask = (tool_input.get("subject") or tool_input.get("description")
+                       or tool_input.get("prompt") or tool_input.get("title")
+                       or tool_input.get("task") or tool_input.get("message"))
             if subtask:
                 return truncate(str(subtask), MAX_TOOL_INPUT_LEN), file_path
 
@@ -1341,16 +1342,79 @@ def extract_claude_hook_subtasks(stdin_data):
     }]
 
 
+def extract_claude_taskcreate_subtasks(stdin_data):
+    """Extract subtasks from Claude Code's TaskCreate tool call."""
+    hook_type = get_hook_type(stdin_data)
+    if hook_type != "PreToolUse":
+        return None
+
+    tool_name = (stdin_data.get("tool_name") or stdin_data.get("toolName") or "").lower()
+    if tool_name != "taskcreate":
+        return None
+
+    tool_input = parse_json_object(stdin_data.get("tool_input") or stdin_data.get("toolInput") or {})
+    if not isinstance(tool_input, dict):
+        return None
+
+    subject = tool_input.get("subject") or tool_input.get("title")
+    if not subject:
+        return None
+
+    now = time.time()
+    tool_use_id = extract_tool_use_id(stdin_data) or f"taskcreate-{now}"
+
+    subtasks = []
+
+    # Main task as the primary subtask entry
+    description = tool_input.get("description")
+    subtasks.append({
+        "id": tool_use_id,
+        "kind": "task",
+        "status": "in_progress",
+        "title": normalize_subtask_title(str(subject)),
+        "summary": normalize_subtask_summary(str(description)) if description else None,
+        "started_at": now,
+        "completed_at": None,
+    })
+
+    # Optional child subtasks from the input
+    child_subtasks = tool_input.get("subtasks") or tool_input.get("tasks") or []
+    if isinstance(child_subtasks, list):
+        for i, st in enumerate(child_subtasks):
+            if not isinstance(st, dict):
+                continue
+            st_subject = st.get("subject") or st.get("title")
+            if not st_subject:
+                continue
+            st_desc = st.get("description")
+            subtasks.append({
+                "id": f"{tool_use_id}-sub-{i + 1}",
+                "kind": "task",
+                "status": "pending",
+                "title": normalize_subtask_title(str(st_subject)),
+                "summary": normalize_subtask_summary(str(st_desc)) if st_desc else None,
+                "started_at": now,
+                "completed_at": None,
+            })
+
+    return subtasks
+
+
 def extract_claude_subtasks(stdin_data):
     """Extract subtasks for Claude Code source.
 
     Priority:
     1. Native SubagentStart/SubagentStop lifecycle hooks
-    2. Transcript-based update_plan fallback
+    2. TaskCreate tool call (parsed from PreToolUse hook)
+    3. Transcript-based update_plan fallback
     """
     hook_subtasks = extract_claude_hook_subtasks(stdin_data)
     if hook_subtasks:
         return hook_subtasks
+
+    taskcreate_subtasks = extract_claude_taskcreate_subtasks(stdin_data)
+    if taskcreate_subtasks:
+        return taskcreate_subtasks
 
     return extract_codex_transcript_subtasks(stdin_data)
 
@@ -1540,6 +1604,8 @@ def build_event(source, stdin_data):
         "model": extract_string_field(stdin_data, "model", "modelName"),
     }
     event["needs_response"] = needs_bridge_response(event)
+    if event["needs_response"]:
+        event["bridge_request_id"] = str(uuid.uuid4())
 
     return event
 
@@ -1628,7 +1694,16 @@ def main():
             print(json.dumps(response, ensure_ascii=False))
             sys.stdout.flush()
         else:
-            # Vland did not respond (timeout / not connected)
+            # Vland did not respond (timeout / not connected).
+            # The approval was likely handled externally (e.g. user approved in CLI).
+            # Notify Vland so it can clean up the pending interaction immediately.
+            send_event({
+                "hook_type": "BridgeDropped",
+                "source": event.get("source"),
+                "session_id": event.get("session_id"),
+                "bridge_request_id": event.get("bridge_request_id"),
+                "timestamp": time.time(),
+            })
             # Safety fallback: exit code 2 blocks the tool execution for approval scenarios
             interaction = event.get("interaction") or {}
             response_mode = interaction.get("responseMode") or interaction.get("response_mode")

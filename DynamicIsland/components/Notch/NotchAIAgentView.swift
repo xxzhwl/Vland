@@ -169,7 +169,6 @@ struct AIAgentSessionCard: View {
     @State private var lastAutoExpandedInteractionID: UUID?
     @ObservedObject var agentManager = AIAgentManager.shared
     @ObservedObject private var quotaMonitor = QuotaMonitorManager.shared
-    @Default(.aiAgentChatDisplayMode) private var chatDisplayMode
     @Default(.aiAgentQuotaMonitorEnabled) private var quotaMonitorEnabled
     @Default(.aiAgentQuotaShowRing) private var quotaShowRing
     @Default(.aiAgentQuotaShowInlineBar) private var quotaShowInlineBar
@@ -558,7 +557,7 @@ struct AIAgentSessionCard: View {
         }
     }
 
-    // MARK: - Expanded Content: conversation flow
+    // MARK: - Expanded Content: unified conversation flow
 
     private var expandedContent: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -576,112 +575,26 @@ struct AIAgentSessionCard: View {
                 .padding(.top, 8)
             }
 
-            // Mode switch header
-            if session.agentType.supportsFullHistory {
-                chatModeSwitch
-                    .padding(.horizontal, 10)
-                    .padding(.top, 6)
+            // Pending interaction banner (always visible)
+            if let latestInteraction = session.latestPendingInteraction, requiresInput {
+                InteractionView(
+                    interaction: latestInteraction,
+                    accentColor: style.accentColor(for: session.agentType),
+                    session: session,
+                    prominent: true,
+                    style: style
+                )
+                .padding(.horizontal, 10)
+                .padding(.top, 8)
             }
 
-            ScrollView(.vertical, showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 6) {
-                    let highlightedInteractionID = session.latestPendingInteraction?.id
-
-                    if let latestInteraction = session.latestPendingInteraction, requiresInput {
-                        InteractionView(
-                            interaction: latestInteraction,
-                            accentColor: style.accentColor(for: session.agentType),
-                            session: session,
-                            prominent: true,
-                            style: style
-                        )
-                    }
-
-                    if chatDisplayMode == .detailed && session.agentType.supportsFullHistory {
-                        // Detailed mode: show full transcript
-                        DetailedChatView(session: session, style: style)
-                    } else {
-                        // Compact mode: original conversation turns
-                        if !session.structuredSubtasks.isEmpty {
-                            SessionTasksView(
-                                tasks: session.structuredSubtasks,
-                                accentColor: style.accentColor(for: session.agentType),
-                                style: style
-                            )
-                        }
-
-                        if !session.subagentToolCalls.isEmpty {
-                            SubagentTasksView(
-                                toolCalls: session.subagentToolCalls,
-                                accentColor: style.accentColor(for: session.agentType),
-                                style: style
-                            )
-                        }
-
-                        if session.conversationTurns.isEmpty {
-                            // No conversation yet — show recent event log
-                            recentActivitySummary
-                        } else {
-                            ForEach(session.conversationTurns) { turn in
-                                TurnView(
-                                    turn: turn,
-                                    session: session,
-                                    hiddenInteractionID: requiresInput ? highlightedInteractionID : nil,
-                                    style: style
-                                )
-                            }
-                        }
-                    }
-                }
-                .padding(10)
-            }
+            // Unified conversation view
+            UnifiedConversationView(
+                session: session,
+                style: style,
+                agentManager: agentManager
+            )
             .frame(maxHeight: style.expandedContentMaxHeight)
-        }
-        .onAppear {
-            // Auto-load transcript when switching to detailed mode
-            if chatDisplayMode == .detailed && session.agentType.supportsFullHistory {
-                Task { await agentManager.loadFullTranscript(for: session) }
-            }
-        }
-        .onChange(of: chatDisplayMode) { _, newMode in
-            if newMode == .detailed && session.agentType.supportsFullHistory {
-                Task { await agentManager.loadFullTranscript(for: session) }
-            }
-        }
-        .onChange(of: session.lastAgentOutput) { _, _ in
-            // Reload transcript when agent output arrives (real-time update for detailed mode)
-            if chatDisplayMode == .detailed && session.agentType.supportsFullHistory {
-                Task { await agentManager.reloadFullTranscript(for: session) }
-            }
-        }
-    }
-
-    private var chatModeSwitch: some View {
-        HStack(spacing: 0) {
-            ForEach(AIAgentChatMode.allCases) { mode in
-                Button(action: {
-                    withAnimation(.spring(response: 0.25)) {
-                        chatDisplayMode = mode
-                    }
-                }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: mode == .compact ? "list.bullet" : "text.bubble.fill")
-                            .font(.system(size: style.scaled(8)))
-                        Text(mode == .compact ? "精简" : "详细")
-                            .font(.system(size: style.scaled(8.5), weight: .medium))
-                    }
-                    .foregroundColor(chatDisplayMode == mode ? .white.opacity(0.95) : .gray.opacity(0.55))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(
-                        RoundedRectangle(cornerRadius: 5, style: .continuous)
-                            .fill(chatDisplayMode == mode ? style.accentColor(for: session.agentType).opacity(0.2) : Color.clear)
-                    )
-                }
-                .buttonStyle(.plain)
-            }
-
-            Spacer()
         }
     }
 
@@ -695,10 +608,9 @@ struct AIAgentSessionCard: View {
                 .frame(width: 14, height: 14)
                 .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
         } else {
-            Image(systemName: session.agentType.iconName)
-                .font(.system(size: style.scaled(10), weight: .semibold))
-                .foregroundColor(style.accentColor(for: session.agentType).opacity(0.9))
+            AgentTypeIconView(agentType: session.agentType, size: style.scaled(12))
                 .frame(width: 14, height: 14)
+                .padding(3)
                 .background(
                     RoundedRectangle(cornerRadius: 4, style: .continuous)
                         .fill(style.accentColor(for: session.agentType).opacity(0.12))
@@ -706,41 +618,6 @@ struct AIAgentSessionCard: View {
         }
     }
 
-    /// Fallback when no conversation turns exist
-    private var recentActivitySummary: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            ForEach(session.eventLog.suffix(10).reversed()) { entry in
-                HStack(alignment: .top, spacing: 6) {
-                    Text(entry.timeString)
-                        .font(.system(size: style.scaled(8), design: .monospaced))
-                        .foregroundColor(.gray.opacity(0.4))
-                        .frame(width: 45, alignment: .leading)
-
-                    Circle()
-                        .fill(colorForHookType(entry.hookType))
-                        .frame(width: 4, height: 4)
-                        .padding(.top, 4)
-
-                    Text(entry.description)
-                        .font(.system(size: style.scaled(9)))
-                        .foregroundColor(.gray.opacity(0.65))
-                        .lineLimit(2)
-                }
-            }
-        }
-    }
-
-    private func colorForHookType(_ type: String) -> Color {
-        switch type {
-        case "UserPromptSubmit": return .blue
-        case "PreToolUse": return .cyan
-        case "PostToolUse": return .green
-        case "Stop": return .orange
-        case "SessionStart": return .green
-        case "SessionEnd": return .red
-        default: return .gray
-        }
-    }
 }
 
 // MARK: - Turn View (one user→agent cycle)
@@ -757,30 +634,32 @@ struct TurnView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            // User question
-            HStack(alignment: .top, spacing: 5) {
-                Image(systemName: "person.fill")
-                    .font(.system(size: style.scaled(8)))
-                    .foregroundColor(.white.opacity(0.4))
-                    .frame(width: 12, height: 12)
+            // User question — only show when there's real user content
+            if !turn.userPrompt.isEmpty {
+                HStack(alignment: .top, spacing: 5) {
+                    Image(systemName: "person.fill")
+                        .font(.system(size: style.scaled(8)))
+                        .foregroundColor(.white.opacity(0.4))
+                        .frame(width: 12, height: 12)
 
-                Text(turn.userPrompt)
-                    .font(.system(size: style.scaled(10), weight: .medium))
-                    .foregroundColor(.white.opacity(0.9))
-                    .lineLimit(3)
-                    .textSelection(.enabled)
+                    Text(turn.userPrompt)
+                        .font(.system(size: style.scaled(10), weight: .medium))
+                        .foregroundColor(.white.opacity(0.9))
+                        .lineLimit(3)
+                        .textSelection(.enabled)
 
-                Spacer()
+                    Spacer()
 
-                Text(turn.timeString)
-                    .font(.system(size: style.scaled(8), design: .monospaced))
-                    .foregroundColor(.gray.opacity(0.35))
+                    Text(turn.timeString)
+                        .font(.system(size: style.scaled(8), design: .monospaced))
+                        .foregroundColor(.gray.opacity(0.35))
+                }
+                .padding(6)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.white.opacity(0.07))
+                )
             }
-            .padding(6)
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.white.opacity(0.07))
-            )
 
             // Tool calls (compact)
             if !turn.toolCalls.isEmpty {
@@ -805,10 +684,9 @@ struct TurnView: View {
                     AgentInlineIcon(agentType: session.agentType, style: style)
                         .frame(width: 12, height: 12)
 
-                    Text(response)
+                    Text(markdownAttributedString(response))
                         .font(.system(size: style.scaled(10)))
                         .foregroundColor(.white.opacity(0.75))
-                        .lineLimit(5)
                         .textSelection(.enabled)
                 }
                 .padding(6)
@@ -1469,9 +1347,7 @@ struct AIAgentWingAgentIcon: View {
                     .frame(width: 12, height: 12)
                     .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
             } else {
-                Image(systemName: agentType.iconName)
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundColor(agentType.accentColor)
+                AgentTypeIconView(agentType: agentType, size: 12)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1499,8 +1375,7 @@ struct AIAgentPendingLeadingWing: View {
                         .frame(width: 12, height: 12)
                         .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
                 } else {
-                    Image(systemName: session.agentType.iconName)
-                        .font(.system(size: 10, weight: .semibold))
+                    AgentTypeIconView(agentType: session.agentType, size: 12)
                         .foregroundStyle(accentColor)
                 }
             }
@@ -1549,10 +1424,30 @@ private struct AgentInlineIcon: View {
                 .aspectRatio(contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
         } else {
-            Image(systemName: agentType.iconName)
-                .font(.system(size: style.scaled(8)))
-                .foregroundColor(agentType.accentColor.opacity(0.6))
+            AgentTypeIconView(agentType: agentType, size: style.scaled(9))
         }
+    }
+}
+
+// MARK: - Markdown Rendering Helper
+
+private let markdownCache = NSCache<NSString, NSAttributedString>()
+
+private func markdownAttributedString(_ markdown: String) -> AttributedString {
+    if let cached = markdownCache.object(forKey: markdown as NSString) {
+        return AttributedString(cached)
+    }
+    do {
+        var attributed = try AttributedString(
+            markdown: markdown,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        )
+        markdownCache.setObject(NSAttributedString(attributed), forKey: markdown as NSString)
+        return attributed
+    } catch {
+        let fallback = AttributedString(markdown)
+        markdownCache.setObject(NSAttributedString(fallback), forKey: markdown as NSString)
+        return fallback
     }
 }
 

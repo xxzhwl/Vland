@@ -44,7 +44,11 @@ final class ShelfItemViewModel: ObservableObject {
     init(item: ShelfItem) {
         self.item = item
         self.draftTitle = item.displayName
-        Task { await loadThumbnail() }
+    }
+
+    func loadThumbnailIfNeeded() async {
+        guard thumbnail == nil else { return }
+        await loadThumbnail()
     }
 
     var isSelected: Bool { selection.isSelected(item.id) }
@@ -543,7 +547,9 @@ final class ShelfItemViewModel: ObservableObject {
                     if !fileURLs.isEmpty {
                         // Start security-scoped access for all URLs and keep them active
                         ShelfItemViewModel.copiedURLs = fileURLs.filter { $0.startAccessingSecurityScopedResource() }
+                        #if DEBUG
                         NSLog("🔐 Started security-scoped access for \(ShelfItemViewModel.copiedURLs.count) copied files")
+                        #endif
                         
                         // Write to pasteboard
                         pb.writeObjects(fileURLs as [NSURL])
@@ -782,7 +788,9 @@ final class ShelfItemViewModel: ObservableObject {
                         if response == .OK, let newURL = savePanel.url {
                             Task {
                                 do {
+                                    #if DEBUG
                                     NSLog("🔐 Rename: moving from \(fileURL.path) to \(newURL.path) (securityScope=\(didStart))")
+                                    #endif
 
                                     try FileManager.default.moveItem(at: fileURL, to: newURL)
 

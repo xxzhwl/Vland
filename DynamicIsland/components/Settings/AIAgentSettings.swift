@@ -19,7 +19,6 @@ struct AIAgentSettings: View {
     @Default(.customAppIcons) private var customAppIcons
     @Default(.aiAgentExpandedRetentionSeconds) var aiAgentExpandedRetentionSeconds
     @Default(.aiAgentAutoCleanupMinutes) var aiAgentAutoCleanupMinutes
-    @Default(.aiAgentChatDisplayMode) var aiAgentChatDisplayMode
     @Default(.aiAgentShowThinkingBlocks) var aiAgentShowThinkingBlocks
     @Default(.aiAgentShowToolDetails) var aiAgentShowToolDetails
     @Default(.aiAgentShowToolOutput) var aiAgentShowToolOutput
@@ -28,7 +27,6 @@ struct AIAgentSettings: View {
     @Default(.aiAgentQuotaShowRing) var aiAgentQuotaShowRing
     @Default(.aiAgentQuotaShowInlineBar) var aiAgentQuotaShowInlineBar
     @Default(.aiAgentThemeMode) private var themeMode
-    @Default(.aiAgentCardTheme) private var cardTheme
     @Default(.aiAgentUniformAccentColor) private var uniformAccentColor
     @Default(.aiAgentCustomConfigDirs) private var aiAgentCustomConfigDirs
     @ObservedObject var agentManager = AIAgentManager.shared
@@ -83,7 +81,7 @@ struct AIAgentSettings: View {
         AIAgentCardStyle(
             fontScale: CGFloat(aiAgentCardFontScale),
             expandedContentMaxHeight: CGFloat(aiAgentCardExpandedMaxHeight),
-            theme: ResolvedCardTheme(from: cardTheme)
+            theme: ResolvedCardTheme(from: .minimal)
         )
     }
 
@@ -125,21 +123,6 @@ struct AIAgentSettings: View {
         }
 
         return "本地版本: \(installed)  ·  最新版本: \(latest)"
-    }
-
-    private var presetOptions: [(name: String, theme: AIAgentCardTheme)] {
-        [
-            ("Default", .defaultTheme),
-            ("Minimal", .minimal),
-            ("Vivid", .vivid),
-            ("Monochrome", .monochrome),
-            ("Neon", .neon),
-            ("Terminal", .terminal),
-        ]
-    }
-
-    private func isPresetSelected(_ theme: AIAgentCardTheme) -> Bool {
-        cardTheme.cardBackgroundOpacity == theme.cardBackgroundOpacity
     }
 
     var body: some View {
@@ -392,29 +375,12 @@ struct AIAgentSettings: View {
                     Text("通知与音效")
                 }
 
-                // MARK: Chat Display Mode
+                // MARK: Chat Display
                 Section {
-                    Picker(selection: $aiAgentChatDisplayMode) {
-                        ForEach(AIAgentChatMode.allCases) { mode in
-                            HStack(spacing: 6) {
-                                Image(systemName: mode == .compact ? "list.bullet" : "text.bubble.fill")
-                                Text(mode == .compact ? "精简模式" : "详细模式")
-                            }
-                            .tag(mode)
-                        }
-                    } label: {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("聊天显示模式")
-                            Text("精简模式：5 轮对话 + 工具调用列表；详细模式：完整对话记录 + Markdown 渲染。")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-
                     Defaults.Toggle(key: .aiAgentShowThinkingBlocks) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("显示思考过程")
-                            Text("在详细模式中显示 AI 的思考（thinking）内容块。")
+                            Text("点击「思考中...」按钮展开查看 AI 的思考内容。")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -423,7 +389,7 @@ struct AIAgentSettings: View {
                     Defaults.Toggle(key: .aiAgentShowToolDetails) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("显示工具调用详情")
-                            Text("在详细模式中显示工具调用的名称和参数。")
+                            Text("点击「执行中...」按钮展开查看工具调用的名称和参数。")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -432,7 +398,7 @@ struct AIAgentSettings: View {
                     Defaults.Toggle(key: .aiAgentShowToolOutput) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("显示工具输出")
-                            Text("在详细模式中显示工具执行的返回结果。")
+                            Text("点击展开后显示工具执行的返回结果。")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -490,27 +456,11 @@ struct AIAgentSettings: View {
                         if themeMode == .uniform {
                             ColorPicker("统一主题色", selection: $uniformAccentColor)
                         }
-
-                        // Preset Cards
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 10) {
-                                ForEach(presetOptions, id: \.name) { preset in
-                                    PresetCardView(
-                                        name: preset.name,
-                                        theme: preset.theme,
-                                        isSelected: isPresetSelected(preset.theme)
-                                    ) {
-                                        cardTheme = preset.theme
-                                    }
-                                }
-                            }
-                            .padding(.vertical, 4)
-                        }
                     }
                 } header: {
-                    Text("卡片主题")
+                    Text("卡片颜色")
                 } footer: {
-                    Text("预设定义卡片背景、边框、文字和间距的默认值。选择预设后可单独调整各参数。")
+                    Text("选择跟随 AI 助手自带主题色，或设定统一的颜色。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -748,9 +698,7 @@ struct AIAgentSettings: View {
                 .frame(width: 22, height: 22)
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         } else {
-            Image(systemName: agentType.iconName)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(agentType.accentColor)
+            AgentTypeIconView(agentType: agentType, size: 18)
                 .frame(width: 22, height: 22)
                 .background(
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -1037,44 +985,3 @@ struct AIAgentSettings: View {
     }
 }
 
-// MARK: - Preset Card View
-
-struct PresetCardView: View {
-    let name: String
-    let theme: AIAgentCardTheme
-    let isSelected: Bool
-    let onSelect: () -> Void
-
-    private var resolvedTheme: ResolvedCardTheme {
-        ResolvedCardTheme(from: theme)
-    }
-
-    var body: some View {
-        Button(action: onSelect) {
-            VStack(spacing: 6) {
-                // Mini card preview
-                RoundedRectangle(cornerRadius: resolvedTheme.cardCornerRadius, style: .continuous)
-                    .fill(Color.white.opacity(resolvedTheme.cardBackgroundOpacity))
-                    .frame(width: 60, height: 40)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: resolvedTheme.cardCornerRadius, style: .continuous)
-                            .strokeBorder(Color.blue.opacity(resolvedTheme.cardBorderOpacity), lineWidth: 0.5)
-                    )
-
-                Text(name)
-                    .font(.system(size: 10, weight: isSelected ? .semibold : .regular))
-                    .foregroundColor(isSelected ? .accentColor : .secondary)
-            }
-            .padding(8)
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(isSelected ? Color.accentColor.opacity(0.1) : Color.clear)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(isSelected ? Color.accentColor.opacity(0.3) : Color.clear, lineWidth: 1)
-            )
-        }
-        .buttonStyle(.plain)
-    }
-}

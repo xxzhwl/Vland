@@ -970,7 +970,7 @@ extension Defaults.Keys {
 
     // MARK: AI Agent Card Theme
     static let aiAgentThemeMode = Key<AIAgentThemeMode>("aiAgentThemeMode", default: .perAgent)
-    static let aiAgentCardTheme = Key<AIAgentCardTheme>("aiAgentCardTheme", default: .defaultTheme)
+    static let aiAgentCardTheme = Key<AIAgentCardTheme>("aiAgentCardTheme", default: .minimal)
     static let aiAgentUniformAccentColor = Key<Color>("aiAgentUniformAccentColor", default: .blue)
     static let aiAgentCustomConfigDirs = Key<[String: String]>("aiAgentCustomConfigDirs", default: [:])
 

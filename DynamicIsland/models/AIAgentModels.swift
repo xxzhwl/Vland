@@ -425,6 +425,7 @@ struct AIAgentHookEvent: Codable {
     let agentId: String?
     let parentToolId: String?
     let rawHookType: String?
+    let bridgeRequestId: String?
     let contextWindow: Int?
     let contextUsed: Int?
     let model: String?
@@ -480,6 +481,7 @@ struct AIAgentHookEvent: Codable {
         case rawHookType = "raw_hook_type"
         case contextWindow = "context_window"
         case contextUsed = "context_used"
+        case bridgeRequestId = "bridge_request_id"
         case model
     }
 
@@ -513,6 +515,22 @@ class AIAgentConversationTurn: Identifiable, ObservableObject {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
         return formatter.string(from: timestamp)
+    }
+
+    /// Append agent response text, preserving earlier partial responses.
+    /// Uses heuristic dedup: if existing is a prefix of new → replace;
+    /// if new is a suffix of existing → skip; otherwise append.
+    func appendResponse(_ output: String) {
+        guard !output.isEmpty else { return }
+        if let existing = agentResponse, !existing.isEmpty {
+            if output.hasPrefix(existing) {
+                agentResponse = output
+            } else if !existing.hasSuffix(output) {
+                agentResponse = existing + "\n\n" + output
+            }
+        } else {
+            agentResponse = output
+        }
     }
 }
 
@@ -662,32 +680,28 @@ struct AIAgentToolCall: Identifiable {
     }
 }
 
-// MARK: - Chat Display Mode
+// MARK: - Chat Display Mode (deprecated, kept for migration)
 
 enum AIAgentChatMode: String, Codable, CaseIterable, Defaults.Serializable, Identifiable {
-    case compact   // 简洁模式：5 轮 + 工具列表
-    case detailed  // 详细模式：完整 transcript + Markdown
+    case compact
 
     var id: String { rawValue }
 
     var displayName: String {
         switch self {
         case .compact: return "简洁模式"
-        case .detailed: return "详细模式"
         }
     }
 
     var description: String {
         switch self {
-        case .compact: return "最近 5 轮对话 + 工具调用列表"
-        case .detailed: return "完整聊天历史 + Markdown 渲染"
+        case .compact: return "统一会话视图"
         }
     }
 
     var iconName: String {
         switch self {
         case .compact: return "list.bullet"
-        case .detailed: return "book.pages"
         }
     }
 }
@@ -695,24 +709,24 @@ enum AIAgentChatMode: String, Codable, CaseIterable, Defaults.Serializable, Iden
 // MARK: - Transcript Message (from transcript files)
 
 /// 来自 transcript 文件的完整消息，用于详细模式显示
-struct TranscriptMessage: Identifiable {
-    let id: String           // message id from transcript
+struct TranscriptMessage: Identifiable, Equatable {
+    let id: String
     let role: MessageRole
     let timestamp: Date?
     let content: [ContentBlock]
 
-    enum MessageRole: String {
+    enum MessageRole: String, Equatable {
         case user
         case assistant
         case system
         case tool
     }
 
-    enum ContentBlock {
+    enum ContentBlock: Equatable {
         case text(String)
         case toolUse(name: String, input: String)
         case toolResult(toolUseId: String, content: String)
-        case thinking(String)     // Claude 的 <thinking> 块
+        case thinking(String)
     }
 
     /// 提取纯文本内容（用于搜索和摘要）
@@ -1178,9 +1192,12 @@ class AIAgentSession: ObservableObject, Identifiable {
                 currentTask = describeToolAction(tool: tool, input: event.toolInput)
                 ensureConversationTurnIfNeeded(seedPrompt: inferredPromptSeed(from: event))
 
-                if isTodoWriteTool(tool), let items = event.todoItems, !items.isEmpty {
-                    let merge = shouldMergeTodoItems(from: event.toolInput)
-                    applyTodoItems(items, merge: merge)
+                if isTodoWriteTool(tool) {
+                    let items = event.todoItems ?? parseTodoItemsFromInput(event.toolInput)
+                    if !items.isEmpty {
+                        let merge = shouldMergeTodoItems(from: event.toolInput)
+                        applyTodoItems(items, merge: merge)
+                    }
                 }
 
                 // Detect interactive tools (agent asking user for input)
@@ -1274,7 +1291,7 @@ class AIAgentSession: ObservableObject, Identifiable {
             // If the notification carries agent output, record it
             if let output = event.agentOutput {
                 lastAgentOutput = output
-                currentTurn?.agentResponse = output
+                currentTurn?.appendResponse(output)
                 recordMeaningfulOutput(output, at: eventDate)
             }
 
@@ -1294,7 +1311,7 @@ class AIAgentSession: ObservableObject, Identifiable {
             // Capture final agent output if present
             if let output = event.agentOutput {
                 lastAgentOutput = output
-                currentTurn?.agentResponse = output
+                currentTurn?.appendResponse(output)
             }
             recordMeaningfulOutput(event.agentOutput ?? event.message, at: eventDate)
             currentTurn?.isComplete = true
@@ -1313,7 +1330,7 @@ class AIAgentSession: ObservableObject, Identifiable {
             // Dedicated event for agent text output
             if let output = event.agentOutput ?? event.message {
                 lastAgentOutput = output
-                currentTurn?.agentResponse = output
+                currentTurn?.appendResponse(output)
                 currentTask = String(output.prefix(80))
                 phase = .active
                 recordMeaningfulOutput(output, at: eventDate)
@@ -1325,7 +1342,7 @@ class AIAgentSession: ObservableObject, Identifiable {
             }
             if let output = event.agentOutput {
                 lastAgentOutput = output
-                currentTurn?.agentResponse = output
+                currentTurn?.appendResponse(output)
                 phase = .active
                 recordMeaningfulOutput(output, at: eventDate)
             }
@@ -1361,6 +1378,7 @@ class AIAgentSession: ObservableObject, Identifiable {
             if isNewerOutput {
                 ensureConversationTurnIfNeeded(seedPrompt: lastUserPrompt)
                 lastAgentOutput = output
+                // Transcript is the authoritative source — replace, don't append
                 currentTurn?.agentResponse = output
                 recordMeaningfulOutput(output, at: outputDate)
                 if status.isActive || status == .sessionStart {
@@ -1461,6 +1479,11 @@ class AIAgentSession: ObservableObject, Identifiable {
                 return "运行子代理: \(String(inp.prefix(40)))"
             }
             return "运行子代理"
+        case "taskcreate":
+            if let inp = input, !inp.isEmpty {
+                return "创建任务: \(String(inp.prefix(40)))"
+            }
+            return "创建任务"
         case "update_plan", "updateplan", "taskcreated", "taskcompleted":
             return "更新任务计划"
         case "ask_followup_question", "askfollowupquestion", "askuserquestion":
@@ -1477,6 +1500,37 @@ class AIAgentSession: ObservableObject, Identifiable {
         let normalized = tool.lowercased()
         return normalized == "todo_write" || normalized == "todowrite"
             || normalized == "update_plan" || normalized == "updateplan"
+            || normalized == "taskcreate"
+    }
+
+    /// Parse todo items from the tool input JSON string (fallback when bridge doesn't send parsed todoItems).
+    /// Expected format: {"items": [{"id": "1", "content": "...", "status": "pending"}, ...]}
+    private func parseTodoItemsFromInput(_ input: String?) -> [AIAgentTodoItem] {
+        guard let input, let data = input.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return []
+        }
+
+        // Try embedded JSON string first
+        if let itemsStr = json["items"] as? String,
+           let itemsData = itemsStr.data(using: .utf8),
+           let items = try? JSONDecoder().decode([AIAgentTodoItem].self, from: itemsData) {
+            return items
+        }
+
+        // Try direct array of dictionaries
+        if let itemsArr = json["items"] as? [[String: Any]] {
+            return itemsArr.compactMap { dict -> AIAgentTodoItem? in
+                guard let id = dict["id"] as? String ?? (dict["id"] as? NSNumber)?.stringValue,
+                      let content = (dict["content"] as? String) ?? (dict["title"] as? String) else {
+                    return nil
+                }
+                let statusRaw = (dict["status"] as? String) ?? "pending"
+                return AIAgentTodoItem(id: id, status: AIAgentTodoItem.TodoStatus(rawValue: statusRaw) ?? .pending, content: content)
+            }
+        }
+
+        return []
     }
 
     private func interactionType(from rawValue: String?) -> AIAgentInteraction.InteractionType {
@@ -1646,10 +1700,11 @@ class AIAgentSession: ObservableObject, Identifiable {
             return
         }
 
-        let prompt = normalizedPromptSeed(seedPrompt)
+        guard let prompt = normalizedPromptSeed(seedPrompt)
             ?? normalizedPromptSeed(lastUserPrompt)
-            ?? normalizedPromptSeed(currentTask)
-            ?? "继续任务"
+        else {
+            return // No real user prompt — don't create a synthetic turn
+        }
 
         let turn = AIAgentConversationTurn(userPrompt: prompt)
         conversationTurns.append(turn)
@@ -1660,9 +1715,9 @@ class AIAgentSession: ObservableObject, Identifiable {
     }
 
     private func inferredPromptSeed(from event: AIAgentHookEvent) -> String? {
+        // Only use actual user-facing fields — event.message is always a system description
         normalizedPromptSeed(event.userPrompt)
             ?? normalizedPromptSeed(lastUserPrompt)
-            ?? normalizedPromptSeed(event.message)
             ?? normalizedPromptSeed(event.toolInput)
     }
 
@@ -1671,7 +1726,18 @@ class AIAgentSession: ObservableObject, Identifiable {
             return nil
         }
 
-        if trimmed == "会话已启动" || trimmed == "启动会话中..." {
+        // Exclude system-generated task descriptions that aren't real user prompts
+        let systemMessages: Set<String> = [
+            "会话已启动", "启动会话中...", "会话已结束",
+            "等待权限审批...", "等待输入...", "等待确认...",
+            "压缩上下文...", "任务完成", "继续任务",
+        ]
+        if systemMessages.contains(trimmed) {
+            return nil
+        }
+        if trimmed.hasPrefix("完成: ") || trimmed.hasPrefix("读取 ") || trimmed.hasPrefix("写入 ")
+            || trimmed.hasPrefix("编辑 ") || trimmed.hasPrefix("执行: ") || trimmed.hasPrefix("搜索: ")
+            || trimmed.hasPrefix("运行子代理: ") || trimmed.hasPrefix("更新") {
             return nil
         }
 

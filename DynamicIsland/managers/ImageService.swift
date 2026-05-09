@@ -22,6 +22,9 @@
 
 import Foundation
 import Defaults
+#if canImport(AppKit)
+import AppKit
+#endif
 
 public protocol ImageServiceProtocol {
     func fetchImageData(from url: URL) async throws -> Data
@@ -31,6 +34,7 @@ public final class ImageService: ImageServiceProtocol {
     public static let shared = ImageService()
 
     private let session: URLSession
+    private let imageCache: NSCache<NSURL, NSImage>
 
     private init() {
         let config = URLSessionConfiguration.default
@@ -47,6 +51,11 @@ public final class ImageService: ImageServiceProtocol {
         config.timeoutIntervalForResource = 30
         config.httpShouldSetCookies = false
         self.session = URLSession(configuration: config)
+
+        let imgCache = NSCache<NSURL, NSImage>()
+        imgCache.countLimit = 50
+        imgCache.totalCostLimit = 50 * 1024 * 1024
+        self.imageCache = imgCache
 
         performLegacyCacheCleanupIfNeeded()
     }
@@ -67,7 +76,19 @@ public final class ImageService: ImageServiceProtocol {
         return data
     }
 
+    public func fetchImage(from url: URL) async -> NSImage? {
+        let nsurl = url as NSURL
+        if let cached = imageCache.object(forKey: nsurl) {
+            return cached
+        }
+        guard let data = try? await fetchImageData(from: url),
+              let image = NSImage(data: data) else { return nil }
+        imageCache.setObject(image, forKey: nsurl, cost: data.count)
+        return image
+    }
+
     public func trimCaches() {
         session.configuration.urlCache?.removeAllCachedResponses()
+        imageCache.removeAllObjects()
     }
 }

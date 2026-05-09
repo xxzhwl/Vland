@@ -325,7 +325,7 @@ class ScreenAssistantManager: NSObject, ObservableObject {
             recordingDuration = 0
             
             // Start timer for recording duration
-            recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            recordingTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
                 self?.updateRecordingDuration()
             }
             

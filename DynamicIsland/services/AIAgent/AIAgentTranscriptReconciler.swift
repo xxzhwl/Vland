@@ -105,28 +105,42 @@ final class AIAgentTranscriptReconciler {
     }
 
     private func latestAgentMessage(from entries: [TranscriptEntry]) -> ReconcilerMessage? {
-        for entry in entries.reversed() {
+        // Find the start of the current turn (latest user_message or task_started)
+        var currentTurnStart = 0
+        for (index, entry) in entries.enumerated() {
+            guard let payload = entry.payload else { continue }
+            if entry.type == "event_msg" {
+                let payloadType = payload["type"] as? String
+                if payloadType == "user_message" || payloadType == "task_started" {
+                    currentTurnStart = index
+                }
+            }
+        }
+
+        // Collect ALL assistant text messages from the current turn,
+        // not just the latest one — preserves intermediate responses like
+        // "好问题，让我先..." before tool calls.
+        let currentTurnEntries = entries[currentTurnStart...]
+        var allTexts: [String] = []
+        var latestTimestamp: Date?
+
+        for entry in currentTurnEntries {
             guard let payload = entry.payload else { continue }
 
+            // agent_message event (e.g. "Claude Code is generating a response")
             if entry.type == "event_msg" {
                 let payloadType = payload["type"] as? String
                 if payloadType == "agent_message",
                    let message = nonEmptyString(payload["message"]) {
-                    return ReconcilerMessage(
-                        message: message,
-                        timestamp: entry.timestamp
-                    )
-                }
-
-                if payloadType == "task_complete",
-                   let message = nonEmptyString(payload["last_agent_message"]) {
-                    return ReconcilerMessage(
-                        message: message,
-                        timestamp: entry.timestamp
-                    )
+                    allTexts.append(message)
+                    if let ts = entry.timestamp, latestTimestamp == nil || ts > latestTimestamp! {
+                        latestTimestamp = ts
+                    }
+                    continue
                 }
             }
 
+            // response_item with assistant role and output_text content blocks
             if entry.type == "response_item",
                payload["type"] as? String == "message",
                payload["role"] as? String == "assistant",
@@ -136,11 +150,29 @@ final class AIAgentTranscriptReconciler {
                     return nonEmptyString(block["text"])
                 }
                 if !texts.isEmpty {
-                    return ReconcilerMessage(
-                        message: texts.joined(separator: "\n"),
-                        timestamp: entry.timestamp
-                    )
+                    allTexts.append(contentsOf: texts)
+                    if let ts = entry.timestamp, latestTimestamp == nil || ts > latestTimestamp! {
+                        latestTimestamp = ts
+                    }
                 }
+            }
+        }
+
+        if !allTexts.isEmpty {
+            return ReconcilerMessage(
+                message: allTexts.joined(separator: "\n\n"),
+                timestamp: latestTimestamp
+            )
+        }
+
+        // Fallback: task_complete event carries last_agent_message
+        for entry in entries.reversed() {
+            guard let payload = entry.payload else { continue }
+            if entry.type == "event_msg",
+               let payloadType = payload["type"] as? String,
+               payloadType == "task_complete",
+               let message = nonEmptyString(payload["last_agent_message"]) {
+                return ReconcilerMessage(message: message, timestamp: entry.timestamp)
             }
         }
 

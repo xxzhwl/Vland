@@ -373,10 +373,45 @@ struct DiskTotals: Equatable {
     static let zero = DiskTotals(readMB: 0, writtenMB: 0)
 }
 
+private struct StatsSnapshot {
+    let cpuUsage: Double
+    let memoryUsage: Double
+    let gpuUsage: Double
+    let networkDownload: Double
+    let networkUpload: Double
+    let diskRead: Double
+    let diskWrite: Double
+    let cpuBreakdown: CPULoadBreakdown
+    let memoryBreakdown: MemoryBreakdown
+    let gpuBreakdown: GPUBreakdown
+    let gpuDevices: [GPUDeviceMetrics]
+    let cpuCoreUsage: [CPUCoreUsage]
+    let cpuLoadAverage: LoadAverage
+    let cpuUptime: TimeInterval
+    let cpuTemperature: CPUTemperatureMetrics
+    let cpuFrequency: CPUFrequencyMetrics?
+    let networkTotals: NetworkTotals
+    let diskTotals: DiskTotals
+    let networkInterfaces: [NetworkInterfaceMetrics]
+    let diskDevices: [DiskDeviceMetrics]
+    let previousNetworkStats: (bytesIn: UInt64, bytesOut: UInt64)
+    let previousDiskStats: (bytesRead: UInt64, bytesWritten: UInt64)
+    let previousTimestamp: Date
+    let cpuHistory: [Double]
+    let memoryHistory: [Double]
+    let gpuHistory: [Double]
+    let networkDownloadHistory: [Double]
+    let networkUploadHistory: [Double]
+    let diskReadHistory: [Double]
+    let diskWriteHistory: [Double]
+}
+
 final class StatsManager: ObservableObject {
     // MARK: - Properties
     static let shared = StatsManager()
-    
+
+    private let statsQueue = DispatchQueue(label: "com.vland.stats.collection", qos: .utility)
+
     @Published var isMonitoring: Bool = false
     @Published var cpuUsage: Double = 0.0
     @Published var memoryUsage: Double = 0.0
@@ -569,8 +604,12 @@ final class StatsManager: ObservableObject {
         
         scheduleMonitoringTimer()
 
-        Task { @MainActor in
-            self.updateSystemStats()
+        statsQueue.async { [weak self] in
+            guard let self else { return }
+            let snapshot = self.collectStatsSnapshot()
+            DispatchQueue.main.async { [weak self] in
+                self?.applyStatsSnapshot(snapshot)
+            }
         }
         
         print("StatsManager: Monitoring started")
@@ -619,10 +658,13 @@ final class StatsManager: ObservableObject {
         }
 
         monitoringTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-
-            Task { @MainActor in
-                self.updateSystemStats()
+            guard let self else { return }
+            statsQueue.async { [weak self] in
+                guard let self else { return }
+                let snapshot = self.collectStatsSnapshot()
+                DispatchQueue.main.async { [weak self] in
+                    self?.applyStatsSnapshot(snapshot)
+                }
             }
         }
     }
@@ -662,8 +704,7 @@ final class StatsManager: ObservableObject {
     }
     
     // MARK: - Private Methods
-    @MainActor
-    private func updateSystemStats() {
+    private func collectStatsSnapshot() -> StatsSnapshot {
         let cpuMetrics = getCPULoadBreakdown()
         let newCpuUsage = cpuMetrics.activeUsage
         let memorySnapshot = getMemorySnapshot()
@@ -671,108 +712,152 @@ final class StatsManager: ObservableObject {
         let gpuSnapshot = getGPUMetrics()
         let newGpuUsage = gpuSnapshot.usage
         let coreUsage = collectCPUCoreUsage()
-        
+
         // Calculate network speeds
         let currentNetworkStats = getNetworkStats()
         let currentTime = Date()
         let timeInterval = currentTime.timeIntervalSince(previousTimestamp)
-        
+
         var downloadSpeed: Double = 0.0
         var uploadSpeed: Double = 0.0
         var bytesDownloaded: UInt64 = 0
         var bytesUploaded: UInt64 = 0
-        
+
         // Only calculate speeds if we have a reasonable time interval and this isn't the first run
         if timeInterval > 0.1 && (previousNetworkStats.bytesIn > 0 || previousNetworkStats.bytesOut > 0) {
-            bytesDownloaded = currentNetworkStats.bytesIn > previousNetworkStats.bytesIn ? 
+            bytesDownloaded = currentNetworkStats.bytesIn > previousNetworkStats.bytesIn ?
                                 currentNetworkStats.bytesIn - previousNetworkStats.bytesIn : 0
-            bytesUploaded = currentNetworkStats.bytesOut > previousNetworkStats.bytesOut ? 
+            bytesUploaded = currentNetworkStats.bytesOut > previousNetworkStats.bytesOut ?
                                currentNetworkStats.bytesOut - previousNetworkStats.bytesOut : 0
-            
+
             downloadSpeed = Double(bytesDownloaded) / timeInterval / 1_048_576 // Convert to MB/s
             uploadSpeed = Double(bytesUploaded) / timeInterval / 1_048_576 // Convert to MB/s
         }
-        
+
         // Calculate disk speeds
         let currentDiskStats = getDiskStats()
         var readSpeed: Double = 0.0
         var writeSpeed: Double = 0.0
         var bytesRead: UInt64 = 0
         var bytesWritten: UInt64 = 0
-        
+
         // Only calculate speeds if we have a reasonable time interval and this isn't the first run
         if timeInterval > 0.1 && (previousDiskStats.bytesRead > 0 || previousDiskStats.bytesWritten > 0) {
-            bytesRead = currentDiskStats.bytesRead > previousDiskStats.bytesRead ? 
+            bytesRead = currentDiskStats.bytesRead > previousDiskStats.bytesRead ?
                            currentDiskStats.bytesRead - previousDiskStats.bytesRead : 0
-            bytesWritten = currentDiskStats.bytesWritten > previousDiskStats.bytesWritten ? 
+            bytesWritten = currentDiskStats.bytesWritten > previousDiskStats.bytesWritten ?
                               currentDiskStats.bytesWritten - previousDiskStats.bytesWritten : 0
-            
+
             readSpeed = Double(bytesRead) / timeInterval / 1_048_576 // Convert to MB/s
             writeSpeed = Double(bytesWritten) / timeInterval / 1_048_576 // Convert to MB/s
         }
-        
-        // Update cumulative transfer totals
-        if bytesDownloaded > 0 {
-            var updatedTotals = networkTotals
-            updatedTotals.downloadedMB += Double(bytesDownloaded) / 1_048_576
-            networkTotals = updatedTotals
-        }
-        if bytesUploaded > 0 {
-            var updatedTotals = networkTotals
-            updatedTotals.uploadedMB += Double(bytesUploaded) / 1_048_576
-            networkTotals = updatedTotals
-        }
-        if bytesRead > 0 {
-            var updatedDiskTotals = diskTotals
-            updatedDiskTotals.readMB += Double(bytesRead) / 1_048_576
-            diskTotals = updatedDiskTotals
-        }
-        if bytesWritten > 0 {
-            var updatedDiskTotals = diskTotals
-            updatedDiskTotals.writtenMB += Double(bytesWritten) / 1_048_576
-            diskTotals = updatedDiskTotals
-        }
-        
-        // Update current values
-        cpuUsage = newCpuUsage
-        gpuUsage = newGpuUsage
-        memoryUsage = newMemoryUsage
-        networkDownload = max(0.0, downloadSpeed)
-        networkUpload = max(0.0, uploadSpeed)
-        diskRead = max(0.0, readSpeed)
-        diskWrite = max(0.0, writeSpeed)
-        lastUpdated = Date()
-        cpuBreakdown = cpuMetrics
-        memoryBreakdown = memorySnapshot.breakdown
-        cpuLoadAverage = getLoadAverage()
-        gpuBreakdown = gpuSnapshot.breakdown
-        if gpuDevices != gpuSnapshot.devices {
-            gpuDevices = gpuSnapshot.devices
-        }
-        if cpuCoreUsage != coreUsage {
-            cpuCoreUsage = coreUsage
-        }
-        cpuUptime = ProcessInfo.processInfo.systemUptime
-        cpuTemperature = cpuSensorCollector.readTemperature()
-        if let frequencyMetrics = cpuSensorCollector.readFrequency() {
-            cpuFrequency = frequencyMetrics
-        }
-        
-        // Update history arrays (sliding window)
-        updateHistory(value: newCpuUsage, history: &cpuHistory)
-        updateHistory(value: newMemoryUsage, history: &memoryHistory)
-        updateHistory(value: newGpuUsage, history: &gpuHistory)
-        updateHistory(value: downloadSpeed, history: &networkDownloadHistory)
-        updateHistory(value: uploadSpeed, history: &networkUploadHistory)
-        updateHistory(value: readSpeed, history: &diskReadHistory)
-        updateHistory(value: writeSpeed, history: &diskWriteHistory)
-        
-        // Update previous stats for next calculation
+
+        var resultNetworkTotals = networkTotals
+        var resultDiskTotals = diskTotals
+        if bytesDownloaded > 0 { resultNetworkTotals.downloadedMB += Double(bytesDownloaded) / 1_048_576 }
+        if bytesUploaded > 0 { resultNetworkTotals.uploadedMB += Double(bytesUploaded) / 1_048_576 }
+        if bytesRead > 0 { resultDiskTotals.readMB += Double(bytesRead) / 1_048_576 }
+        if bytesWritten > 0 { resultDiskTotals.writtenMB += Double(bytesWritten) / 1_048_576 }
+
+        let loadAverage = getLoadAverage()
+        let uptime = ProcessInfo.processInfo.systemUptime
+        let temperature = cpuSensorCollector.readTemperature()
+        let frequency = cpuSensorCollector.readFrequency()
+
+        // Build history arrays
+        var cpuHist = cpuHistory
+        var memoryHist = memoryHistory
+        var gpuHist = gpuHistory
+        var netDownHist = networkDownloadHistory
+        var netUpHist = networkUploadHistory
+        var diskRHist = diskReadHistory
+        var diskWHist = diskWriteHistory
+        updateHistory(value: newCpuUsage, history: &cpuHist)
+        updateHistory(value: newMemoryUsage, history: &memoryHist)
+        updateHistory(value: newGpuUsage, history: &gpuHist)
+        updateHistory(value: downloadSpeed, history: &netDownHist)
+        updateHistory(value: uploadSpeed, history: &netUpHist)
+        updateHistory(value: readSpeed, history: &diskRHist)
+        updateHistory(value: writeSpeed, history: &diskWHist)
+
+        let interfaces = collectNetworkInterfaces(deltaTime: timeInterval)
+        let devices = collectDiskDevices()
+
+        // Update internal state for next collection cycle
         previousNetworkStats = currentNetworkStats
         previousDiskStats = currentDiskStats
         previousTimestamp = currentTime
-        networkInterfaces = collectNetworkInterfaces(deltaTime: timeInterval)
-        diskDevices = collectDiskDevices()
+
+        let gpuDevicesMatch = gpuSnapshot.devices
+        let cpuCoreUsageMatch = coreUsage
+
+        return StatsSnapshot(
+            cpuUsage: newCpuUsage,
+            memoryUsage: newMemoryUsage,
+            gpuUsage: newGpuUsage,
+            networkDownload: max(0.0, downloadSpeed),
+            networkUpload: max(0.0, uploadSpeed),
+            diskRead: max(0.0, readSpeed),
+            diskWrite: max(0.0, writeSpeed),
+            cpuBreakdown: cpuMetrics,
+            memoryBreakdown: memorySnapshot.breakdown,
+            gpuBreakdown: gpuSnapshot.breakdown,
+            gpuDevices: gpuDevicesMatch,
+            cpuCoreUsage: coreUsage,
+            cpuLoadAverage: loadAverage,
+            cpuUptime: uptime,
+            cpuTemperature: temperature,
+            cpuFrequency: frequency,
+            networkTotals: resultNetworkTotals,
+            diskTotals: resultDiskTotals,
+            networkInterfaces: interfaces,
+            diskDevices: devices,
+            previousNetworkStats: currentNetworkStats,
+            previousDiskStats: currentDiskStats,
+            previousTimestamp: currentTime,
+            cpuHistory: cpuHist,
+            memoryHistory: memoryHist,
+            gpuHistory: gpuHist,
+            networkDownloadHistory: netDownHist,
+            networkUploadHistory: netUpHist,
+            diskReadHistory: diskRHist,
+            diskWriteHistory: diskWHist
+        )
+    }
+
+    @MainActor
+    private func applyStatsSnapshot(_ snapshot: StatsSnapshot) {
+        cpuUsage = snapshot.cpuUsage
+        gpuUsage = snapshot.gpuUsage
+        memoryUsage = snapshot.memoryUsage
+        networkDownload = snapshot.networkDownload
+        networkUpload = snapshot.networkUpload
+        diskRead = snapshot.diskRead
+        diskWrite = snapshot.diskWrite
+        lastUpdated = Date()
+        cpuBreakdown = snapshot.cpuBreakdown
+        memoryBreakdown = snapshot.memoryBreakdown
+        cpuLoadAverage = snapshot.cpuLoadAverage
+        gpuBreakdown = snapshot.gpuBreakdown
+        if gpuDevices != snapshot.gpuDevices { gpuDevices = snapshot.gpuDevices }
+        if cpuCoreUsage != snapshot.cpuCoreUsage { cpuCoreUsage = snapshot.cpuCoreUsage }
+        cpuUptime = snapshot.cpuUptime
+        cpuTemperature = snapshot.cpuTemperature
+        cpuFrequency = snapshot.cpuFrequency
+
+        cpuHistory = snapshot.cpuHistory
+        memoryHistory = snapshot.memoryHistory
+        gpuHistory = snapshot.gpuHistory
+        networkDownloadHistory = snapshot.networkDownloadHistory
+        networkUploadHistory = snapshot.networkUploadHistory
+        diskReadHistory = snapshot.diskReadHistory
+        diskWriteHistory = snapshot.diskWriteHistory
+
+        networkTotals = snapshot.networkTotals
+        diskTotals = snapshot.diskTotals
+        networkInterfaces = snapshot.networkInterfaces
+        diskDevices = snapshot.diskDevices
+
         refreshProcessStatsIfNeeded(force: true)
     }
     

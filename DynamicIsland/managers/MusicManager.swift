@@ -92,6 +92,7 @@ final class MusicManager: ObservableObject {
     private var controllers: [MediaControllerType: any MediaControllerProtocol] = [:]
     private var trackedSources: [MediaControllerType: TrackedMediaSource] = [:]
     private var sourceCleanupTimer: Timer?
+    private var sourceCleanupRegistered = false
     private var debounceIdleTask: Task<Void, Never>?
     @MainActor private var pendingOptimisticPlayState: Bool?
     private var activeControllerType: MediaControllerType?
@@ -299,8 +300,7 @@ final class MusicManager: ObservableObject {
         debounceIdleTask?.cancel()
         lyricSyncTask?.cancel()
         workItem?.cancel()
-        sourceCleanupTimer?.invalidate()
-        sourceCleanupTimer = nil
+        sourceCleanupRegistered = false
         cancellables.removeAll()
         transitionWorkItem?.cancel()
         teardownControllers()
@@ -428,8 +428,9 @@ final class MusicManager: ObservableObject {
     }
 
     private func startSourceCleanupTimer() {
-        guard sourceCleanupTimer == nil else { return }
-        sourceCleanupTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+        guard !sourceCleanupRegistered else { return }
+        sourceCleanupRegistered = true
+        BackgroundTaskCoordinator.shared.register { [weak self] in
             Task { @MainActor in
                 self?.refreshTrackedSourcesAndSelection()
             }
