@@ -92,6 +92,11 @@ func enabledStandardTabCount() -> Int {
         count += 1
     }
 
+    // Stock tab
+    if Defaults[.enableStockFeature] {
+        count += 1
+    }
+
     return count
 }
 

@@ -253,6 +253,7 @@ struct SettingsView: View {
             // Developer
             .stats,
             .terminal,
+            .stock,
             .aiAgent,
             // Integrations
             .extensions,
@@ -772,6 +773,10 @@ struct SettingsView: View {
         case .terminal:
             SettingsForm(tab: .terminal) {
                 TerminalSettings()
+            }
+        case .stock:
+            SettingsForm(tab: .stock) {
+                StockSettingsView()
             }
         case .aiAgent:
             SettingsForm(tab: .aiAgent) {

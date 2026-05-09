@@ -74,6 +74,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     case pluginLauncher
     case notes
     case terminal
+    case stock
     case aiAgent
     case about
 
@@ -89,6 +90,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .clipboard, .screenAssistant, .colorPicker, .shelf,
              .downloads, .shortcuts, .pluginLauncher:                             return .utilities
         case .stats, .terminal, .aiAgent:                                     return .developer
+        case .stock:                                                          return .utilities
         case .extensions:                                                    return .integrations
         case .about:                                                         return .info
         }
@@ -117,6 +119,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .pluginLauncher: return String(localized: "Quick Launch")
         case .notes: return String(localized: "Notes")
         case .terminal: return String(localized: "Terminal")
+        case .stock: return String(localized: "Stock")
         case .aiAgent: return String(localized: "AI Agents")
         case .about: return String(localized: "About")
         }
@@ -145,6 +148,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .pluginLauncher: return "puzzlepiece.extension"
         case .notes: return "note.text"
         case .terminal: return "apple.terminal"
+        case .stock: return "chart.line.uptrend.xyaxis"
         case .aiAgent: return "cpu"
         case .about: return "info.circle"
         }
@@ -173,6 +177,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .pluginLauncher: return .indigo
         case .notes: return Color(red: 0.979, green: 0.716, blue: 0.153, opacity: 1.000)
         case .terminal: return Color(red: 0.2, green: 0.8, blue: 0.4)
+        case .stock: return .orange
         case .aiAgent: return .cyan
         case .about: return .secondary
         }

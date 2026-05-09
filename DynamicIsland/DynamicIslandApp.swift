@@ -117,6 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let extensionXPCServiceHost = ExtensionXPCServiceHost.shared
     let extensionRPCServer = ExtensionRPCServer.shared
     let quotaMonitorManager = QuotaMonitorManager.shared
+    let stockManager = StockManager.shared
     var closeNotchWorkItem: DispatchWorkItem?
     private var previousScreens: [NSScreen]?
     private var onboardingWindowController: NSWindowController?
@@ -402,6 +403,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Use a consistent height for different view types
         if currentView == .home {
             baseSize.height += homeAIAgentPreviewAdditionalHeight()
+        } else if currentView == .stock {
+            let contentHeight = Defaults[.stockPanelMaxHeight]
+            let fixedElements: CGFloat = 110
+            baseSize.height = min(contentHeight + fixedElements, max(baseSize.height, contentHeight + fixedElements))
         } else if currentView == .timer {
             baseSize.height = 250 // Extra space for timer presets
         } else if currentView == .notes || currentView == .clipboard {
@@ -529,6 +534,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         
         // Initialize idle animations (load bundled + built-in face)
         idleAnimationManager.initializeDefaultAnimations()
+        _ = stockManager // Ensure StockManager is initialized
+
+        // 空闲行为由 DynamicIslandFaceAnimation 综合判断 idleBehavior + showNotHumanFace
+
+        // 如果启用了股票功能，启动自动刷新
+        if Defaults[.enableStockFeature] {
+            stockManager.startAutoRefresh()
+        }
 
         applySelectedAppIcon()
         installTopMenuItemsIfNeeded()

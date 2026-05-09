@@ -34,6 +34,11 @@ final class AIAgentHookConfigurator: ObservableObject {
         var isInstalled: Bool { installedVersion != nil }
         var isOutdated: Bool {
             guard let installedVersion, let bundledVersion else { return false }
+            let a = installedVersion.filter(\.isWholeNumber)
+            let b = bundledVersion.filter(\.isWholeNumber)
+            if let aNum = Int(a), let bNum = Int(b) {
+                return aNum < bNum
+            }
             return installedVersion != bundledVersion
         }
     }

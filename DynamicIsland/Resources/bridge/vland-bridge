@@ -25,7 +25,7 @@ import argparse
 import hashlib
 from datetime import datetime
 
-VLAND_BRIDGE_VERSION = "2026.04.24.1"
+VLAND_BRIDGE_VERSION = "2026.05.07.1"
 
 SOCKET_PATH = os.path.join(os.environ.get("TMPDIR", "/tmp"), "vland-ai-agent.sock")
 
@@ -47,6 +47,27 @@ TRANSCRIPT_TAIL_LINES = 2000
 STREAM_HOOK_TYPES = {"PostToolUse", "Stop", "SessionEnd", "Notification"}
 STREAM_STATE_DIR = os.path.join(os.path.expanduser("~"), ".vland", "state")
 BRIDGE_RESPONSE_TIMEOUT = 120
+CODEX_INTERNAL_PROMPT_PREFIXES = (
+    "Generate 0 to 3 ambient suggestions for this local project:",
+    "You are a helpful assistant. You will be presented with a user prompt, "
+    "and your job is to provide a short title for a task that will be created from that prompt.",
+    "You are an expert at upholding safety and compliance standards for Codex ambient suggestions.",
+)
+
+
+def should_ignore_event(event):
+    """Return True for Codex app internal jobs that should not appear as user sessions."""
+    if event.get("source") != "codex":
+        return False
+    if event.get("hook_type") != "UserPromptSubmit":
+        return False
+
+    prompt = event.get("user_prompt")
+    if not isinstance(prompt, str):
+        return False
+
+    normalized = " ".join(prompt.strip().split())
+    return any(normalized.startswith(prefix) for prefix in CODEX_INTERNAL_PROMPT_PREFIXES)
 
 
 def truncate(s, max_len):
@@ -1599,6 +1620,8 @@ def main():
 
     stdin_data = parse_stdin()
     event = build_event(args.source, stdin_data)
+    if should_ignore_event(event):
+        return
     if event.get("needs_response") is True:
         response = send_event_and_wait(event)
         if response is not None:

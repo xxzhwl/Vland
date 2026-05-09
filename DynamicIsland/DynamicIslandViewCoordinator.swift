@@ -307,12 +307,8 @@ class DynamicIslandViewCoordinator: ObservableObject {
         if AIAgentManager.shared.hasPendingApproval {
             switchToView(.aiAgent, animated: false)
             toggleExpandingView(status: true, type: .aiAgent)
-            return
         }
-        if let delegate = AppDelegate.shared, delegate.vm.notchState == .closed {
-            delegate.vm.open()
-        }
-        switchToView(.aiAgent)
+        // 非审批交互（任务进度等）不自动跳转，用户可通过主页 AI 助手栏点击导航
     }
 
     private func handleExtensionExperienceSnapshot(_ experiences: [ExtensionNotchExperiencePayload]) {

@@ -63,6 +63,7 @@ struct TabSelectionView: View {
     @Default(.customTabOrder) private var customTabOrder
     @Default(.tabSpacing) private var tabSpacing
     @Default(.tabSpacingAutoShrink) private var tabSpacingAutoShrink
+    @Default(.enableStockFeature) var enableStockFeature
     @Namespace var animation
     
     // Drag-to-reorder state
@@ -101,6 +102,9 @@ struct TabSelectionView: View {
         }
         if Defaults[.enableAIAgentFeature] {
             tabsArray.append(TabModel(label: "AI Agents", icon: "cpu", view: .aiAgent))
+        }
+        if enableStockFeature {
+            tabsArray.append(TabModel(label: "Stock", icon: "chart.line.uptrend.xyaxis", view: .stock))
         }
         if extensionTabsEnabled {
             for payload in extensionTabPayloads {

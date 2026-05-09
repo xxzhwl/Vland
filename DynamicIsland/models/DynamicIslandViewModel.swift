@@ -331,6 +331,7 @@ class DynamicIslandViewModel: NSObject, ObservableObject {
     }
 
     func open() {
+        guard notchState != .open else { return }
         let targetSize = calculateDynamicNotchSize()
 
         let applyWindowResize: () -> Void = {

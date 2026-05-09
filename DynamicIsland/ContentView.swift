@@ -93,6 +93,9 @@ struct ContentView: View {
     @Default(.showStandardMediaControls) var showStandardMediaControls
     @Default(.externalDisplayStyle) var externalDisplayStyle
     @Default(.hideNonNotchUntilHover) var hideNonNotchUntilHover
+    @Default(.idleBehavior) var idleBehavior
+    @Default(.showNotHumanFace) var showNotHumanFace
+    @Default(.enableStockFeature) var enableStockFeature
     
     // Dynamic sizing based on view type and graph count with smooth transitions
     var dynamicNotchSize: CGSize {
@@ -154,7 +157,14 @@ struct ContentView: View {
                 return CGSize(width: baseSize.width, height: baseSize.height + extraHeight)
             }
         }
-        
+
+        if coordinator.currentView == .stock {
+            let contentHeight = Defaults[.stockPanelMaxHeight]
+            let fixedElements: CGFloat = 110 // profit summary + divider + toolbar + padding
+            let stockHeight = min(contentHeight + fixedElements, max(baseSize.height, contentHeight + fixedElements))
+            return CGSize(width: baseSize.width, height: stockHeight)
+        }
+
         guard coordinator.currentView == .stats else {
             return baseSize
         }
@@ -195,7 +205,6 @@ struct ContentView: View {
 
     @Default(.useMusicVisualizer) var useMusicVisualizer
     @Default(.musicControlWindowEnabled) var musicControlWindowEnabled
-    @Default(.showNotHumanFace) var showNotHumanFace
     @Default(.useModernCloseAnimation) var useModernCloseAnimation
     @Default(.enableMinimalisticUI) var enableMinimalisticUI
 
@@ -948,6 +957,8 @@ struct ContentView: View {
                                 NotchTerminalView()
                             case .aiAgent:
                                 NotchAIAgentView()
+                            case .stock:
+                                NotchStockView()
                             case .extensionExperience:
                                 if let payload = currentExtensionTabPayload() {
                                     ExtensionNotchExperienceTabView(payload: payload)
@@ -1020,14 +1031,21 @@ struct ContentView: View {
     @ViewBuilder
     func DynamicIslandFaceAnimation() -> some View {
         HStack {
-            HStack {
-                Rectangle()
-                    .fill(.clear)
-                    .frame(width: max(0, vm.effectiveClosedNotchHeight - 12), height: max(0, vm.effectiveClosedNotchHeight - 12))
-                Rectangle()
-                    .fill(.black)
-                    .frame(width: vm.closedNotchSize.width - 20)
-                IdleAnimationView()
+            if idleBehavior == .stockCarousel && enableStockFeature && StockManager.anyMarketOpen() {
+                // 股票轮播：自行处理摄像头两侧布局
+                StockIdleDisplayView(cameraWidth: vm.closedNotchSize.width - 20)
+            } else {
+                HStack {
+                    Rectangle()
+                        .fill(.clear)
+                        .frame(width: max(0, vm.effectiveClosedNotchHeight - 12), height: max(0, vm.effectiveClosedNotchHeight - 12))
+                    Rectangle()
+                        .fill(.black)
+                        .frame(width: vm.closedNotchSize.width - 20)
+                    if idleBehavior == .animation && showNotHumanFace {
+                        IdleAnimationView()
+                    }
+                }
             }
         }.frame(height: vm.effectiveClosedNotchHeight + (isHovering ? 8 : 0), alignment: .center)
     }
