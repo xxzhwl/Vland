@@ -118,6 +118,9 @@ integration.json
 *.moved-aside
 *.xcuserstate
 
+# Signing certificates (private key — do not commit)
+/scripts/certs/
+
 # GitHub instructions and agent files
 #
 .github/instructions/

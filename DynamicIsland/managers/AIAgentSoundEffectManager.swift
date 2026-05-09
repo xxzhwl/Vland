@@ -93,9 +93,8 @@ final class AIAgentSoundEffectManager {
             return
         }
 
-        // Use .interrupts option which automatically stops current playback and starts the new buffer
-        // No need to call stop() or play() separately - .interrupts handles everything
         playerNode.scheduleBuffer(buffer, at: nil, options: .interrupts)
+        playerNode.play()
     }
 
     private func makeBuffer(for cue: Cue, format: AVAudioFormat) -> AVAudioPCMBuffer? {
