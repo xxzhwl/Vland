@@ -437,9 +437,11 @@ class DynamicIslandViewModel: NSObject, ObservableObject {
             if webcamManager.isSessionRunning {
                 webcamManager.stopSession()
                 isCameraExpanded = false
+                Defaults[.showMirror] = false
             } else if webcamManager.cameraAvailable {
                 webcamManager.startSession()
                 isCameraExpanded = true
+                Defaults[.showMirror] = true
             }
 
         case .denied, .restricted:

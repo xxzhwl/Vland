@@ -68,22 +68,20 @@ struct DynamicIslandHeader: View {
 
             HStack(spacing: 4) {
                 if vm.notchState == .open && !Defaults[.enableMinimalisticUI] {
-                    if Defaults[.showMirror] {
-                        Button(action: {
-                            vm.toggleCameraPreview()
-                        }) {
-                            Capsule()
-                                .fill(.black)
-                                .frame(width: 30, height: 30)
-                                .overlay {
-                                    Image(systemName: "web.camera")
-                                        .foregroundColor(.white)
-                                        .padding()
-                                        .imageScale(.medium)
-                                }
-                        }
-                        .buttonStyle(PlainButtonStyle())
+                    Button(action: {
+                        vm.toggleCameraPreview()
+                    }) {
+                        Capsule()
+                            .fill(webcamManager.isSessionRunning ? Color.accentColor.opacity(0.2) : .black)
+                            .frame(width: 30, height: 30)
+                            .overlay {
+                                Image(systemName: webcamManager.isSessionRunning ? "web.camera.fill" : "web.camera")
+                                    .foregroundColor(webcamManager.isSessionRunning ? .accentColor : .white)
+                                    .padding()
+                                    .imageScale(.medium)
+                            }
                     }
+                    .buttonStyle(PlainButtonStyle())
                     
                     if Defaults[.enableClipboardManager]
                         && showClipboardIcon

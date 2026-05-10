@@ -439,11 +439,6 @@ struct Appearance: View {
             }
 
             Section {
-                Defaults.Toggle(key: .showMirror) {
-                    Text("Enable Dynamic mirror")
-                }
-                .disabled(!checkVideoInput())
-                .settingsHighlight(id: highlightID("Enable Dynamic mirror"))
                 Picker("Mirror shape", selection: $mirrorShape) {
                     Text("Circle")
                         .tag(MirrorShapeEnum.circle)

@@ -68,6 +68,12 @@ final class AIAgentManager: ObservableObject {
     private var pendingBridgeResponseIDsByConnection: [AIAgentSocketServer.ClientConnection: UUID] = [:]
     private var bridgeRequestIdToInteractionID: [String: UUID] = [:]
 
+    /// Socket connections keyed by session key, for sending proactive messages
+    /// (user typing in the input bar when the agent isn't waiting for input).
+    /// The bridge script must keep the connection open and listen for unsolicited
+    /// "UserPromptSubmit" messages for this to work.
+    private var sessionSocketConnections: [String: AIAgentSocketServer.ClientConnection] = [:]
+
     private struct PasteboardSnapshot {
         let items: [[NSPasteboard.PasteboardType: Data]]
 
@@ -120,7 +126,18 @@ final class AIAgentManager: ObservableObject {
     }
 
     var todoSneakPeekSessions: [AIAgentSession] {
-        activeSessions.filter { !$0.todoItems.isEmpty || !$0.displaySubtasks.isEmpty }
+        activeSessions.filter { session in
+            // Must have tasks to display
+            guard !session.todoItems.isEmpty || !session.displaySubtasks.isEmpty else {
+                return false
+            }
+            // Exclude sessions waiting for user input (AI is idle, not working)
+            // unless they have a pending interaction (e.g., approval request)
+            if session.status == .waitingInput && session.latestPendingInteraction == nil {
+                return false
+            }
+            return true
+        }
     }
 
     var hasRestorableTodoSneakPeek: Bool {
@@ -360,6 +377,78 @@ final class AIAgentManager: ObservableObject {
         pendingBridgeInteractionIDs.contains(interactionID)
     }
 
+    /// Whether there's an active socket connection for this session.
+    /// Used to determine if proactive prompting is available.
+    func hasActiveBridgeConnection(for session: AIAgentSession) -> Bool {
+        guard let key = sessionStore.key(forSessionID: session.id) else { return false }
+        return sessionSocketConnections[key] != nil
+    }
+
+    /// Sends a proactive user prompt to the bridge when there's no pending interaction.
+    /// Tries socket first (fast path), then tmux, then falls back to clipboard+app activation.
+    func sendProactivePrompt(session: AIAgentSession, prompt: String) async -> Bool {
+        // Try 1: socket connection (fast path)
+        if let key = sessionStore.key(forSessionID: session.id),
+           let connection = sessionSocketConnections[key] {
+            let payload: [String: Any] = [
+                "source": session.agentType.rawValue,
+                "hook_type": "UserPromptSubmit",
+                "timestamp": Date().timeIntervalSince1970,
+                "session_id": session.sessionId ?? "",
+                "user_prompt": prompt,
+            ]
+
+            if await socketServer.sendResponse(payload, to: connection, closeAfterWrite: false) {
+                return true
+            }
+        }
+
+        // Try 2: tmux (for CLI agents running in tmux)
+        if let tty = session.tty {
+            let tmuxController = TmuxController.shared
+            if let target = await tmuxController.findTarget(forTTY: tty) {
+                if await tmuxController.sendMessage(prompt, to: target) {
+                    return true
+                }
+            }
+        }
+
+        // Try 3: clipboard + app activation (like vibe-notch's paste-and-submit approach)
+        return await sendProactiveViaClipboard(session: session, prompt: prompt)
+    }
+
+    /// Fallback: copy prompt to clipboard, activate the agent app, paste and submit.
+    /// Works without an active socket connection.
+    private func sendProactiveViaClipboard(session: AIAgentSession, prompt: String) async -> Bool {
+        let pasteboard = NSPasteboard.general
+        let snapshot = PasteboardSnapshot.capture(from: pasteboard)
+
+        pasteboard.clearContents()
+        pasteboard.setString(prompt, forType: .string)
+        let authoredChangeCount = pasteboard.changeCount
+
+        guard AccessibilityPermissionStore.shared.isAuthorized else {
+            AccessibilityPermissionStore.shared.requestAuthorizationPrompt()
+            activateAgentApp(session: session)
+            snapshot.restore(to: pasteboard)
+            return false
+        }
+
+        guard let targetApp = await prepareApplicationForInteractionResponse(session: session) else {
+            activateAgentApp(session: session)
+            snapshot.restore(to: pasteboard)
+            return false
+        }
+
+        let didSubmit = await sendPasteAndSubmit(to: targetApp)
+
+        // Restore pasteboard after a short delay to let the paste happen
+        try? await Task.sleep(nanoseconds: 450_000_000)
+        restorePasteboard(snapshot, ifChangeCountIs: authoredChangeCount)
+
+        return didSubmit
+    }
+
     private func submitBridgeInteractionResponse(
         session: AIAgentSession,
         interaction: AIAgentInteraction,
@@ -412,6 +501,13 @@ final class AIAgentManager: ObservableObject {
             return false
         }
 
+        // Clean up stale session socket connection — sendResponse will close
+        // the socket (closeAfterWrite: true by default), making it unusable.
+        let staleKeys = sessionSocketConnections.filter { $0.value == pending.connection }.keys
+        for key in staleKeys {
+            sessionSocketConnections.removeValue(forKey: key)
+        }
+
         _ = cleanupPendingBridgeResponse(interactionID)
         return await socketServer.sendResponse(payload, to: pending.connection)
     }
@@ -458,6 +554,7 @@ final class AIAgentManager: ObservableObject {
 
             if isListening {
                 self.startStaleSessionCleanup()
+                self.discoverExistingSessions()
             }
         }
 
@@ -488,6 +585,7 @@ final class AIAgentManager: ObservableObject {
         pendingBridgeResponseIDsByConnection.removeAll()
         pendingBridgeInteractionIDs.removeAll()
         bridgeRequestIdToInteractionID.removeAll()
+        sessionSocketConnections.removeAll()
         pendingSessionRemovalItems.values.forEach { $0.cancel() }
         pendingSessionRemovalItems.removeAll()
     }
@@ -510,6 +608,10 @@ final class AIAgentManager: ObservableObject {
 
         let result = eventReducer.reduce(event, in: sessionStore)
         let session = result.session
+
+        // Store the latest socket connection for this session
+        // so we can send proactive user prompts when there's no pending interaction.
+        sessionSocketConnections[result.sessionKey] = connection
 
         syncSessionsFromStore()
         refreshTranscriptWatch(for: session, sessionKey: result.sessionKey)
@@ -638,6 +740,9 @@ final class AIAgentManager: ObservableObject {
     }
 
     private func handleClientDisconnect(connection: AIAgentSocketServer.ClientConnection) {
+        // Clean up per-session connection tracking
+        sessionSocketConnections = sessionSocketConnections.filter { $0.value != connection }
+
         if let interactionID = pendingBridgeResponseIDsByConnection[connection],
            let pending = cleanupPendingBridgeResponse(interactionID),
            let session = sessionStore.session(forKey: pending.sessionKey) {
@@ -936,6 +1041,66 @@ final class AIAgentManager: ObservableObject {
         }
     }
 
+    /// On startup, discover running agent processes and create sessions for them.
+    /// Called once after the socket server starts. This bridges the gap between
+    /// Vland restarting (which wipes in-memory sessions) and the next real hook event.
+    private func discoverExistingSessions() {
+        Task.detached(priority: .background) { [weak self] in
+            guard let self else { return }
+            let discovered = AIAgentSessionDiscovery.discoverRunningSessions()
+            guard !discovered.isEmpty else { return }
+
+            await MainActor.run { [discovered, weak self] in
+                guard let self else { return }
+                for info in discovered {
+                    let event = AIAgentHookEvent(
+                        source: info.agentType.rawValue,
+                        hookType: "SessionStart",
+                        timestamp: Date().timeIntervalSince1970,
+                        sessionId: info.sessionId,
+                        pid: info.pid.map(Int.init),
+                        tty: nil,
+                        needsResponse: false,
+                        toolName: nil,
+                        toolInput: nil,
+                        toolInputRaw: nil,
+                        filePath: nil,
+                        project: info.project,
+                        transcriptPath: info.transcriptPath,
+                        message: "会话已恢复",
+                        userPrompt: nil,
+                        agentOutput: nil,
+                        toolOutput: nil,
+                        todoItems: nil,
+                        subtasks: nil,
+                        interaction: nil,
+                        toolUseId: nil,
+                        agentId: nil,
+                        parentToolId: nil,
+                        rawHookType: nil,
+                        bridgeRequestId: nil,
+                        contextWindow: nil,
+                        contextUsed: nil,
+                        model: nil
+                    )
+
+                    let result = self.eventReducer.reduce(event, in: self.sessionStore)
+
+                    if result.wasCreated {
+                        result.session.status = .thinking
+                        result.session.phase = .active
+                        result.session.currentTask = "会话已恢复"
+                        self.refreshTranscriptWatch(for: result.session, sessionKey: result.sessionKey)
+                    }
+                }
+
+                if !discovered.isEmpty {
+                    self.syncSessionsFromStore()
+                }
+            }
+        }
+    }
+
     private func shouldDisplayInCollapsedNotch(_ session: AIAgentSession, now: Date) -> Bool {
         guard !session.isArchived else { return false }
         let age = now.timeIntervalSince(session.lastActivity)
@@ -948,7 +1113,12 @@ final class AIAgentManager: ObservableObject {
             let hasRealActivity = session.lastUserPrompt != nil || !session.conversationTurns.isEmpty
             let timeout: TimeInterval = hasRealActivity ? activeSessionVisibilityTimeout : 15
             return age <= timeout
-        case .thinking, .coding, .running, .waitingInput:
+        case .thinking, .coding, .running:
+            return age <= activeSessionVisibilityTimeout
+        case .waitingInput:
+            // Only show in collapsed notch if there's a pending interaction (e.g., approval request)
+            // If AI is just waiting for next user input (CLI idle), don't show
+            guard session.latestPendingInteraction != nil else { return false }
             return age <= activeSessionVisibilityTimeout
         case .completed, .error, .idle, .sessionEnd:
             return false

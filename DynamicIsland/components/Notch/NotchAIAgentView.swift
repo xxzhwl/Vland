@@ -154,8 +154,13 @@ struct AIAgentSessionListView: View {
             VStack(spacing: 6) {
                 ForEach(sessions) { session in
                     AIAgentSessionCard(session: session, style: style)
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .top).combined(with: .opacity),
+                            removal: .identity
+                        ))
                 }
             }
+            .animation(.spring(response: 0.35, dampingFraction: 0.85), value: sessions.count)
         }
     }
 }
@@ -196,6 +201,12 @@ struct AIAgentSessionCard: View {
 
     private var latestInteractionID: UUID? {
         session.latestPendingInteraction?.id
+    }
+
+    private var sessionStartTimeString: String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        return formatter.string(from: session.startTime)
     }
 
     private var headerTaskText: String {
@@ -268,15 +279,31 @@ struct AIAgentSessionCard: View {
             RoundedRectangle(cornerRadius: style.theme.cardCornerRadius, style: .continuous)
                 .fill(Color.white.opacity(style.theme.cardBackgroundOpacity))
         )
-        .overlay(
+        .overlay(alignment: .center) {
+            let isAwaitingInput = requiresInput
             RoundedRectangle(cornerRadius: style.theme.cardCornerRadius, style: .continuous)
-                .strokeBorder(style.accentColor(for: session.agentType).opacity(style.theme.cardBorderOpacity), lineWidth: 0.5)
-        )
+                .strokeBorder(
+                    style.accentColor(for: session.agentType)
+                        .opacity(isAwaitingInput ? attentionGlow : style.theme.cardBorderOpacity),
+                    lineWidth: isAwaitingInput ? 1.5 : 0.5
+                )
+                .animation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true), value: attentionGlow)
+        }
         .onAppear {
             autoExpandForLatestInteractionIfNeeded()
+            if requiresInput { startAttentionGlow() }
         }
         .onChange(of: latestInteractionID) { _, _ in
             autoExpandForLatestInteractionIfNeeded()
+            if requiresInput { startAttentionGlow() }
+        }
+    }
+
+    @State private var attentionGlow: CGFloat = 0.5
+
+    private func startAttentionGlow() {
+        withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
+            attentionGlow = 1.0
         }
     }
 
@@ -391,7 +418,10 @@ struct AIAgentSessionCard: View {
 
                         Spacer()
 
-                        // Elapsed time
+                        // Start time + Elapsed time
+                        Text(sessionStartTimeString)
+                            .font(.system(size: style.scaled(8.5), design: .monospaced))
+                            .foregroundColor(.gray.opacity(0.35))
                         Text(session.elapsedTimeString)
                             .font(.system(size: style.scaled(9), design: .monospaced))
                             .foregroundColor(.gray.opacity(0.4))
@@ -595,6 +625,29 @@ struct AIAgentSessionCard: View {
                 agentManager: agentManager
             )
             .frame(maxHeight: style.expandedContentMaxHeight)
+
+            // Chat input bar for bridge-based agents
+            // Reply mode: show when there's a pending pasteReply interaction
+            // Proactive mode: show for active CLI-backed sessions (like vibe-notch)
+            let hasPendingPasteReply = session.latestPendingInteraction?.responseMode == .pasteReply
+            if hasPendingPasteReply, let interaction = session.latestPendingInteraction {
+                ChatInputBar(
+                    pendingInteraction: interaction,
+                    session: session,
+                    style: style
+                )
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+            } else if session.isCLIBacked, session.status.isActive {
+                // Show input bar for active CLI sessions
+                ChatInputBar(
+                    pendingInteraction: nil,
+                    session: session,
+                    style: style
+                )
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+            }
         }
     }
 
@@ -886,7 +939,7 @@ struct InteractionView: View {
                                             .strokeBorder(selectedOption == option ? accentColor.opacity(0.35) : Color.white.opacity(0.06), lineWidth: 0.5)
                                     )
                                 }
-                                .buttonStyle(.plain)
+                                .buttonStyle(PressScaleStyle())
                                 .disabled(isSubmitting || interaction.isResolved)
                             } else {
                                 HStack(spacing: 5) {
@@ -1448,6 +1501,287 @@ private func markdownAttributedString(_ markdown: String) -> AttributedString {
         let fallback = AttributedString(markdown)
         markdownCache.setObject(NSAttributedString(fallback), forKey: markdown as NSString)
         return fallback
+    }
+}
+
+// MARK: - Chat Input Bar (for bridge-based agents)
+
+/// A text input bar that lets users type messages directly in the Dynamic Island.
+/// Supports two modes:
+/// 1. Reply mode (pendingInteraction with pasteReply) — responds to an agent question
+/// 2. Proactive mode (no pending interaction) — sends a new user prompt as an interrupt
+struct ChatInputBar: View {
+    let pendingInteraction: AIAgentInteraction?
+    @ObservedObject var session: AIAgentSession
+    let style: AIAgentCardStyle
+
+    @State private var text: String = ""
+    @State private var isSubmitting = false
+    @State private var submissionResult: SubmissionResult?
+    @State private var dismissFeedbackTask: Task<Void, Never>?
+    @FocusState private var isFocused: Bool
+    @ObservedObject private var agentManager = AIAgentManager.shared
+
+    private enum SubmissionResult: Equatable {
+        case submitted(String)
+        case copied(String)
+        case proactiveSent(String)
+        case failed(String)
+    }
+
+    private var accentColor: Color {
+        style.accentColor(for: session.agentType)
+    }
+
+    private var isReplyMode: Bool {
+        pendingInteraction?.responseMode == .pasteReply
+    }
+
+    private var canSend: Bool {
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isSubmitting
+    }
+
+    private var placeholderText: String {
+        isReplyMode ? "输入回复..." : "输入消息..."
+    }
+
+    var body: some View {
+        VStack(spacing: 6) {
+            // Status hint for proactive mode
+            if !isReplyMode {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.up.forward")
+                        .font(.system(size: style.scaled(8)))
+                    Text("消息将发送给助手")
+                        .font(.system(size: style.scaled(8.5)))
+                }
+                .foregroundColor(.gray.opacity(0.5))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            // Submission feedback
+            if let result = submissionResult {
+                feedbackRow(result: result)
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .bottom).combined(with: .opacity),
+                        removal: .opacity
+                    ))
+            }
+
+            // Input row
+            HStack(spacing: 6) {
+                TextField(placeholderText, text: $text)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: style.scaled(11)))
+                    .foregroundColor(.white.opacity(0.9))
+                    .focused($isFocused)
+                    .disabled(isSubmitting)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .textFieldStyle(.plain)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Color.white.opacity(0.06))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.1), lineWidth: 0.5)
+                    )
+                    .onSubmit(submit)
+
+                Button(action: submit) {
+                    Group {
+                        if isSubmitting {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .scaleEffect(0.8)
+                        } else {
+                            Image(systemName: "arrow.up.circle.fill")
+                                .font(.system(size: style.scaled(20)))
+                                .foregroundColor(canSend ? accentColor : .gray.opacity(0.4))
+                        }
+                    }
+                    .frame(width: 30, height: 30)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(PressScaleStyle())
+                .disabled(!canSend)
+                .help("发送 (Enter)")
+                .scaleEffect(canSend ? 1.0 : 0.9)
+                .animation(.spring(response: 0.3, dampingFraction: 0.7), value: canSend)
+            }
+        }
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.white.opacity(0.04))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.06), lineWidth: 0.5)
+        )
+        .onAppear { isFocused = true }
+    }
+
+    private func submit() {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard canSend, !trimmed.isEmpty else { return }
+
+        dismissFeedbackTask?.cancel()
+        isSubmitting = true
+        submissionResult = nil
+        let previousText = text
+
+        if isReplyMode, let interaction = pendingInteraction {
+            // Reply to a pending interaction (existing flow)
+            Task {
+                let result = await agentManager.submitInteractionResponse(
+                    session: session,
+                    interaction: interaction,
+                    option: trimmed
+                )
+
+                await MainActor.run {
+                    isSubmitting = false
+                    switch result {
+                    case .submitted:
+                        submissionResult = .submitted(trimmed)
+                        text = ""
+                        isFocused = true
+                        scheduleFeedbackDismiss()
+                    case .copiedForManualSend:
+                        submissionResult = .copied(trimmed)
+                        scheduleFeedbackDismiss()
+                    case .requiresAccessibility:
+                        submissionResult = .copied(trimmed)
+                        scheduleFeedbackDismiss()
+                    case .failed(let message):
+                        submissionResult = .failed(message)
+                        text = previousText
+                    }
+                }
+            }
+        } else {
+            // Send as proactive prompt
+            Task {
+                let success = await agentManager.sendProactivePrompt(
+                    session: session,
+                    prompt: trimmed
+                )
+
+                await MainActor.run {
+                    isSubmitting = false
+                    if success {
+                        // Add the prompt to conversation history
+                        let turn = AIAgentConversationTurn(userPrompt: trimmed)
+                        session.conversationTurns.append(turn)
+                        session.lastUserPrompt = trimmed
+                        submissionResult = .proactiveSent(trimmed)
+                        text = ""
+                        isFocused = true
+                        scheduleFeedbackDismiss()
+                    } else {
+                        submissionResult = .failed("发送失败，请在终端直接输入")
+                        text = previousText
+                    }
+                }
+            }
+        }
+    }
+
+    private func scheduleFeedbackDismiss() {
+        dismissFeedbackTask?.cancel()
+        dismissFeedbackTask = Task {
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                withAnimation(.easeOut(duration: 0.25)) {
+                    submissionResult = nil
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func feedbackRow(result: SubmissionResult) -> some View {
+        HStack(spacing: 5) {
+            switch result {
+            case .submitted:
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: style.scaled(8)))
+                    .foregroundColor(.green.opacity(0.8))
+                Text("回复已发送")
+                    .font(.system(size: style.scaled(9)))
+                    .foregroundColor(.green.opacity(0.75))
+
+            case .proactiveSent:
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: style.scaled(8)))
+                    .foregroundColor(.green.opacity(0.8))
+                Text("消息已发送")
+                    .font(.system(size: style.scaled(9)))
+                    .foregroundColor(.green.opacity(0.75))
+
+            case .copied:
+                Image(systemName: "doc.on.clipboard.fill")
+                    .font(.system(size: style.scaled(8)))
+                    .foregroundColor(.orange.opacity(0.8))
+                Text("已复制到剪贴板，需手动粘贴到助手窗口")
+                    .font(.system(size: style.scaled(9)))
+                    .foregroundColor(.orange.opacity(0.75))
+
+            case .failed(let message):
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.system(size: style.scaled(8)))
+                    .foregroundColor(.red.opacity(0.8))
+                Text(message)
+                    .font(.system(size: style.scaled(9)))
+                    .foregroundColor(.red.opacity(0.75))
+                    .lineLimit(2)
+            }
+
+            Spacer()
+
+            Button {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    submissionResult = nil
+                }
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: style.scaled(7)))
+                    .foregroundColor(.gray.opacity(0.5))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(resultBackgroundColor.opacity(0.08))
+        )
+        .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+
+    private var resultBackgroundColor: Color {
+        switch submissionResult {
+        case .submitted: return .green
+        case .proactiveSent: return .green
+        case .copied: return .orange
+        case .failed, .none: return .red
+        }
+    }
+}
+
+// MARK: - Press Scale Button Style
+
+/// A button style that subtly scales down on press for tactile feedback.
+private struct PressScaleStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.96 : 1.0)
+            .animation(.spring(response: 0.2, dampingFraction: 0.7), value: configuration.isPressed)
     }
 }
 

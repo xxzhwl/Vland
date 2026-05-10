@@ -12,6 +12,7 @@ import AppKit
 struct DevicesSettingsView: View {
     @Default(.progressBarStyle) var progressBarStyle
     @Default(.useBluetoothHUD3DIcon) private var useBluetoothHUD3DIcon
+    @Default(.homeBatteryDisplayStyle) private var homeBatteryDisplayStyle
 
     private func highlightID(_ title: String) -> String {
         SettingsTab.devices.highlightID(for: title)
@@ -28,6 +29,16 @@ struct DevicesSettingsView: View {
                     Text("Show Bluetooth device connections")
                 }
                 .settingsHighlight(id: highlightID("Show Bluetooth device connections"))
+                Defaults.Toggle(key: .showBluetoothBatteryHomeWidget) {
+                    Text("Show Bluetooth battery in home view")
+                }
+                .settingsHighlight(id: highlightID("Show Bluetooth battery in home view"))
+                Picker("Battery display style", selection: $homeBatteryDisplayStyle) {
+                    ForEach(HomeBatteryDisplayStyle.allCases, id: \.self) { style in
+                        Text(style.label).tag(style)
+                    }
+                }
+                .settingsHighlight(id: highlightID("Battery display style"))
                 Defaults.Toggle(key: .useCircularBluetoothBatteryIndicator) {
                     Text("Use circular battery indicator")
                 }

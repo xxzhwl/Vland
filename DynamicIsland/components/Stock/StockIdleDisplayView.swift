@@ -35,6 +35,7 @@ struct StockIdleDisplayView: View {
     @State private var timer: Timer?
 
     var body: some View {
+        Group {
         if stockWatchlist.isEmpty {
             HStack(spacing: 0) {
                 Spacer()
@@ -104,6 +105,8 @@ struct StockIdleDisplayView: View {
                 restartTimer()
             }
         }
+        }
+        .preferredColorScheme(.dark)
     }
 
     private var currentStock: Stock? {

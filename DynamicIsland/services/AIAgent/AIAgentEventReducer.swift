@@ -45,7 +45,7 @@ final class AIAgentEventReducer {
                 session: existingSession,
                 wasCreated: false,
                 hadVisibleTasks: hadVisibleTasks,
-                shouldScheduleEndedRemoval: shouldScheduleEndedRemoval(for: event)
+                shouldScheduleEndedRemoval: shouldScheduleEndedRemoval(for: event, session: existingSession)
             )
         }
 
@@ -70,7 +70,7 @@ final class AIAgentEventReducer {
             session: session,
             wasCreated: true,
             hadVisibleTasks: false,
-            shouldScheduleEndedRemoval: shouldScheduleEndedRemoval(for: event)
+            shouldScheduleEndedRemoval: shouldScheduleEndedRemoval(for: event, session: session)
         )
     }
 
@@ -90,8 +90,13 @@ final class AIAgentEventReducer {
         return event.source + "-" + (normalizedText(event.project) ?? "default")
     }
 
-    private func shouldScheduleEndedRemoval(for event: AIAgentHookEvent) -> Bool {
-        event.hookType == "SessionEnd" || event.hookType == "Stop"
+    private func shouldScheduleEndedRemoval(for event: AIAgentHookEvent, session: AIAgentSession? = nil) -> Bool {
+        // "SessionEnd" means the process terminated — always schedule removal.
+        // "Stop" means a single turn completed. For CLI-backed agents the process
+        // is still alive waiting for input, so keep the session active.
+        if event.hookType == "SessionEnd" { return true }
+        if event.hookType == "Stop" { return !(session?.isCLIBacked ?? false) }
+        return false
     }
 
     private func sessionHasVisibleTaskState(_ session: AIAgentSession) -> Bool {

@@ -35,8 +35,6 @@ struct AIAgentSettings: View {
     @State private var isConfiguring = false
     @State private var isIconImporterPresented = false
     @State private var iconImportError: String?
-    @State private var previewSessions = AIAgentSettings.makePreviewSessions()
-
     private func highlightID(_ title: String) -> String {
         SettingsTab.aiAgent.highlightID(for: title)
     }
@@ -75,14 +73,6 @@ struct AIAgentSettings: View {
             if l == r { return lhs.displayName < rhs.displayName }
             return l < r
         }
-    }
-
-    private var previewStyle: AIAgentCardStyle {
-        AIAgentCardStyle(
-            fontScale: CGFloat(aiAgentCardFontScale),
-            expandedContentMaxHeight: CGFloat(aiAgentCardExpandedMaxHeight),
-            theme: ResolvedCardTheme(from: .minimal)
-        )
     }
 
     private var bridgeVersionStatus: AIAgentHookConfigurator.BridgeVersionStatus {
@@ -486,32 +476,6 @@ struct AIAgentSettings: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Section {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("预览")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(.secondary)
-
-                        AIAgentSessionListView(sessions: previewSessions, style: previewStyle)
-                            .frame(maxHeight: 320)
-                            .padding(10)
-                            .background(
-                                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                    .fill(Color.black.opacity(0.22))
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                    .strokeBorder(Color.white.opacity(0.06), lineWidth: 0.5)
-                            )
-                    }
-                } header: {
-                    Text("预览")
-                } footer: {
-                    Text("在应用到实际会话前，可在此调整密度。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
                 // MARK: Cleanup
                 Section {
                     VStack(alignment: .leading, spacing: 8) {
@@ -564,7 +528,6 @@ struct AIAgentSettings: View {
                 agentManager.detectInstalledAgents()
                 agentManager.hookConfig.detectClaudeQuotaHookStatus()
             }
-            refreshPreviewSessions()
         }
         .onChange(of: enableAIAgentFeature) { _, newValue in
             if newValue {
@@ -943,45 +906,5 @@ struct AIAgentSettings: View {
         iconImportError = nil
     }
 
-    private func refreshPreviewSessions() {
-        previewSessions = Self.makePreviewSessions()
-    }
-
-    private static func makePreviewSessions() -> [AIAgentSession] {
-        let activeSession = AIAgentSession(agentType: .codex, project: "/Users/zhanwanli/dev/Vland", sessionId: "preview-active")
-        activeSession.status = .coding
-        activeSession.lastUserPrompt = "Add 8-bit sound effects and a live card preview to the AI agent settings."
-        activeSession.currentTask = "Editing AIAgent settings and preview components"
-        activeSession.todoItems = [
-            AIAgentTodoItem(id: "preview-1", status: .completed, content: "Wire AI agent sound effects"),
-            AIAgentTodoItem(id: "preview-2", status: .inProgress, content: "Build live session card preview"),
-            AIAgentTodoItem(id: "preview-3", status: .pending, content: "Add per-agent icon customization"),
-        ]
-        let activeTurn = AIAgentConversationTurn(userPrompt: activeSession.lastUserPrompt ?? "")
-        activeTurn.toolCalls = [
-            AIAgentToolCall(timestamp: Date(), toolName: "read_file", input: "DynamicIsland/components/Notch/NotchAIAgentView.swift", output: "Loaded", filePath: "DynamicIsland/components/Notch/NotchAIAgentView.swift"),
-            AIAgentToolCall(timestamp: Date(), toolName: "replace_in_file", input: "AIAgentSettings.swift", output: nil, filePath: "DynamicIsland/components/Settings/AIAgentSettings.swift"),
-        ]
-        activeSession.conversationTurns = [activeTurn]
-
-        let waitingSession = AIAgentSession(agentType: .claudeCode, project: "/Users/zhanwanli/dev/Vland", sessionId: "preview-waiting")
-        waitingSession.status = .waitingInput
-        waitingSession.lastUserPrompt = "Should the preview use the real card component or a lighter mock?"
-        waitingSession.currentTask = "Waiting for your input..."
-        let waitingTurn = AIAgentConversationTurn(userPrompt: waitingSession.lastUserPrompt ?? "")
-        waitingTurn.interactions = [
-            AIAgentInteraction(
-                timestamp: Date(),
-                type: .question,
-                title: "Preview Mode",
-                message: "Choose how the settings page should render the preview cards.",
-                options: ["Use the real card component", "Use a lightweight mock"],
-                responseMode: .pasteReply
-            )
-        ]
-        waitingSession.conversationTurns = [waitingTurn]
-
-        return [waitingSession, activeSession]
-    }
 }
 

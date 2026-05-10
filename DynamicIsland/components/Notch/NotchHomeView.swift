@@ -637,6 +637,7 @@ struct NotchHomeView: View {
     @ObservedObject var coordinator = DynamicIslandViewCoordinator.shared
     @ObservedObject private var extensionNotchExperienceManager = ExtensionNotchExperienceManager.shared
     @ObservedObject private var musicManager = MusicManager.shared
+    @ObservedObject private var bluetoothManager = BluetoothAudioManager.shared
     @Default(.showStandardMediaControls) private var showStandardMediaControls
     @Default(.autoHideInactiveNotchMediaPlayer) private var autoHideInactiveNotchMediaPlayer
     let albumArtNamespace: Namespace.ID
@@ -687,14 +688,22 @@ struct NotchHomeView: View {
                         }
                         .environmentObject(vm)
                     }
-                    
-                    if Defaults[.showMirror],
-                       webcamManager.cameraAvailable,
-                       vm.notchState == .open {
-                        CameraPreviewView(webcamManager: webcamManager)
-                            .scaledToFit()
-                            .opacity(vm.notchState == .closed ? 0 : 1)
-                            .blur(radius: vm.notchState == .closed ? 20 : 0)
+
+                    let showCameraInHome = webcamManager.isSessionRunning && webcamManager.cameraAvailable
+
+                    if Defaults[.showBluetoothBatteryHomeWidget] || showCameraInHome {
+                        ZStack {
+                            if showCameraInHome {
+                                CameraPreviewView(webcamManager: webcamManager)
+                                    .scaledToFit()
+                                    .transition(.opacity.combined(with: .scale(scale: 0.85)))
+                            } else {
+                                BluetoothBatteryHomeView()
+                                    .transition(.opacity.combined(with: .scale(scale: 0.85)))
+                            }
+                        }
+                        .animation(.smooth(duration: 0.35), value: showCameraInHome)
+                        .frame(maxWidth: 200)
                     }
                 }
             }

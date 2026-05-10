@@ -93,6 +93,7 @@ struct NotchStockView: View {
     }
 
     var body: some View {
+        Group {
         if let stock = chartStock {
             StockKLineChartView(stock: stock, onBack: { chartStock = nil })
         } else {
@@ -188,6 +189,8 @@ struct NotchStockView: View {
             }
             .padding(.vertical, 8)
         }
+        }
+        .preferredColorScheme(.dark)
     }
 }
 

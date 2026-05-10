@@ -411,6 +411,7 @@ struct AIAgentHookEvent: Codable {
     let needsResponse: Bool?
     let toolName: String?       // e.g. "read_file", "write_to_file", "execute_command"
     let toolInput: String?      // brief description of what the tool is doing
+    let toolInputRaw: [String: String]? // raw tool input parameters (for diff display)
     let filePath: String?       // current file being worked on
     let project: String?        // project directory
     let transcriptPath: String?
@@ -465,6 +466,7 @@ struct AIAgentHookEvent: Codable {
         case needsResponse = "needs_response"
         case toolName = "tool_name"
         case toolInput = "tool_input"
+        case toolInputRaw = "tool_input_raw"
         case filePath = "file_path"
         case project
         case transcriptPath = "transcript_path"
@@ -634,6 +636,9 @@ struct AIAgentToolCall: Identifiable {
     let input: String?       // what the tool received (file path, command, etc.)
     var output: String?      // what the tool returned
     let filePath: String?
+    let oldString: String?   // old_string for edit/replace diffs (from bridge tool_input_raw)
+    let newString: String?   // new_string for edit/replace diffs (from bridge tool_input_raw)
+    let toolInputRaw: [String: String]?  // full raw input parameters (for diff display like vibe-notch)
 
     var timeString: String {
         let formatter = DateFormatter()
@@ -643,32 +648,29 @@ struct AIAgentToolCall: Identifiable {
 
     /// Human-friendly description of the tool action
     var displayDescription: String {
-        switch toolName {
-        case "read_file":
+        switch toolName.lowercased() {
+        case "read_file", "readfile", "read":
             if let path = filePath ?? input { return "Read \((path as NSString).lastPathComponent)" }
             return "Read file"
-        case "write_to_file":
+        case "write_to_file", "writetofile", "write":
             if let path = filePath ?? input { return "Write \((path as NSString).lastPathComponent)" }
             return "Write file"
-        case "replace_in_file":
+        case "replace_in_file", "replaceinfile", "edit":
             if let path = filePath ?? input { return "Edit \((path as NSString).lastPathComponent)" }
             return "Edit file"
-        case "execute_command":
+        case "execute_command", "executecommand", "bash":
             if let cmd = input { return "Run: \(String(cmd.prefix(60)))" }
             return "Run command"
-        case "search_content", "search_file":
+        case "search_content", "searchcontent", "search_file", "searchfile", "grep":
             if let q = input { return "Search: \(String(q.prefix(40)))" }
             return "Search codebase"
-        case "list_dir":
+        case "list_dir", "listdir":
             if let dir = input { return "List \((dir as NSString).lastPathComponent)" }
             return "Browse directory"
-        case "web_search":
+        case "web_search", "websearch", "web_fetch", "webfetch":
             if let q = input { return "Search web: \(String(q.prefix(40)))" }
             return "Search web"
-        case "web_fetch":
-            if let url = input { return "Fetch: \(String(url.prefix(50)))" }
-            return "Fetch URL"
-        case "task":
+        case "task", "agent":
             if let description = input, !description.isEmpty {
                 return "Subagent: \(String(description.prefix(60)))"
             }
@@ -1230,7 +1232,10 @@ class AIAgentSession: ObservableObject, Identifiable {
                         toolName: tool,
                         input: event.toolInput,
                         output: nil,
-                        filePath: event.filePath
+                        filePath: event.filePath,
+                        oldString: event.toolInputRaw?["old_string"],
+                        newString: event.toolInputRaw?["new_string"],
+                        toolInputRaw: event.toolInputRaw
                     )
                     currentTurn?.toolCalls.append(toolCall)
                 }
@@ -1304,10 +1309,20 @@ class AIAgentSession: ObservableObject, Identifiable {
 
         case "Stop":
             ensureConversationTurnIfNeeded(seedPrompt: inferredPromptSeed(from: event))
-            status = .completed
-            phase = .completed
-            currentTask = event.message ?? "任务完成"
-            finalizeTrackedItemsForCompletion()
+            if isCLIBacked {
+                // CLI-backed agents (e.g. Claude Code) keep the process alive after
+                // each response — "Stop" means "turn complete, waiting for next input",
+                // not "session ended".  Only "SessionEnd" should mark these as completed.
+                status = .waitingInput
+                phase = .waitingForInput
+                currentTask = event.message ?? "等待输入"
+                // Don't finalize tasks for CLI-backed agents on Stop — they're still in progress
+            } else {
+                status = .completed
+                phase = .completed
+                currentTask = event.message ?? "任务完成"
+                finalizeTrackedItemsForCompletion()
+            }
             // Capture final agent output if present
             if let output = event.agentOutput {
                 lastAgentOutput = output
@@ -1387,10 +1402,16 @@ class AIAgentSession: ObservableObject, Identifiable {
             }
         }
 
-        if snapshot.indicatesCompletion, status != .completed {
-            status = .completed
-            phase = .completed
-            currentTask = lastAgentOutput.map { String($0.prefix(80)) } ?? "任务完成"
+        if snapshot.indicatesCompletion, status != .completed, status != .waitingInput {
+            if isCLIBacked {
+                status = .waitingInput
+                phase = .waitingForInput
+                currentTask = lastAgentOutput.map { String($0.prefix(80)) } ?? "等待输入"
+            } else {
+                status = .completed
+                phase = .completed
+                currentTask = lastAgentOutput.map { String($0.prefix(80)) } ?? "任务完成"
+            }
             finalizeTrackedItemsForCompletion()
             currentTurn?.isComplete = true
         }

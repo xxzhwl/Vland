@@ -159,6 +159,8 @@ mew-notch/
 /appdmg.json
 
 /build-release
+/build-debug
+
 /distSPM/
 
 # App backup artifacts (not needed for build)

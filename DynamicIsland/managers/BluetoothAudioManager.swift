@@ -34,12 +34,14 @@ class BluetoothAudioManager: ObservableObject {
     @Published var lastConnectedDevice: BluetoothAudioDevice?
     @Published var connectedDevices: [BluetoothAudioDevice] = []
     @Published var isBluetoothAudioConnected: Bool = false
+    @Published var nonAudioAccessories: [BluetoothAudioDevice] = []
     
     // MARK: - Private Properties
     private var observers: [NSObjectProtocol] = []
     private var cancellables = Set<AnyCancellable>()
     private let coordinator = DynamicIslandViewCoordinator.shared
     private var pollingTimer: Timer?
+    private var nonAudioPollingTimer: Timer?
     private let bluetoothPreferencesSuite = "/Library/Preferences/com.apple.Bluetooth"
     private let batteryReader = BluetoothLEBatteryReader()
     private var isLiveBatteryRefreshInFlight = false
@@ -67,6 +69,12 @@ class BluetoothAudioManager: ObservableObject {
 
     private var batteryStatusByAddress: [String: Int] = [:]
     private var batteryStatusByName: [String: Int] = [:]
+    private var batteryStatusByAddressLeft: [String: Int] = [:]
+    private var batteryStatusByAddressRight: [String: Int] = [:]
+    private var batteryStatusByAddressCase: [String: Int] = [:]
+    private var batteryStatusByNameLeft: [String: Int] = [:]
+    private var batteryStatusByNameRight: [String: Int] = [:]
+    private var batteryStatusByNameCase: [String: Int] = [:]
     private var missingBatteryLog: Set<String> = []
     private var lastBatteryStatusUpdate: Date?
     private let batteryStatusUpdateInterval: TimeInterval = 20
@@ -85,6 +93,7 @@ class BluetoothAudioManager: ObservableObject {
         setupAudioRouteObserver()
         checkInitialDevices()
         startPollingForChanges()
+        startNonAudioAccessoryPolling()
     }
     
     deinit {
@@ -214,9 +223,20 @@ class BluetoothAudioManager: ObservableObject {
     /// Starts polling for device connection changes (fallback mechanism)
     private func startPollingForChanges() {
         print("🎧 [BluetoothAudioManager] Starting polling timer (3s interval)...")
-        
+
         pollingTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             self?.checkForDeviceChanges()
+        }
+    }
+
+    private func startNonAudioAccessoryPolling() {
+        // Poll pmset for non-audio accessories (Apple Watch) every 30 seconds
+        nonAudioPollingTimer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
+            self?.refreshNonAudioAccessories()
+        }
+        // Initial fetch after a short delay
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            self?.refreshNonAudioAccessories()
         }
     }
     
@@ -815,7 +835,13 @@ class BluetoothAudioManager: ObservableObject {
         var updatedDevices: [BluetoothAudioDevice] = []
         for device in connectedDevices {
             let refreshedLevel = bestBatteryLevel(for: device)
-            let updatedDevice = device.withBatteryLevel(refreshedLevel)
+            let subLevels = bestSubComponentLevels(for: device)
+            let updatedDevice = device.withBatteryLevel(
+                refreshedLevel,
+                left: subLevels.left,
+                right: subLevels.right,
+                caseLevel: subLevels.caseLevel
+            )
             updatedDevices.append(updatedDevice)
 
             if let refreshedLevel {
@@ -842,6 +868,21 @@ class BluetoothAudioManager: ObservableObject {
             ?? batteryLevelFromDefaults(forAddress: device.address)
             ?? batteryLevelFromDefaults(forName: device.name)
             ?? device.batteryLevel
+    }
+
+    private func bestSubComponentLevels(for device: BluetoothAudioDevice) -> (left: Int?, right: Int?, caseLevel: Int?) {
+        let address = device.address
+        let name = device.name
+        let left = batteryStatusByAddressLeft[normalizeBluetoothIdentifier(address)]
+            ?? batteryStatusByNameLeft[normalizeProductName(name)]
+            ?? device.batteryLevelLeft
+        let right = batteryStatusByAddressRight[normalizeBluetoothIdentifier(address)]
+            ?? batteryStatusByNameRight[normalizeProductName(name)]
+            ?? device.batteryLevelRight
+        let caseLevel = batteryStatusByAddressCase[normalizeBluetoothIdentifier(address)]
+            ?? batteryStatusByNameCase[normalizeProductName(name)]
+            ?? device.batteryLevelCase
+        return (left, right, caseLevel)
     }
 
     private func requestPmsetFallback(reason: String) {
@@ -876,9 +917,46 @@ class BluetoothAudioManager: ObservableObject {
 
         batteryStatusByName = updatedNames
         applyConnectedDeviceBatteryLevels(triggerPmsetFallback: false)
+        updateNonAudioAccessories(from: entries)
 
         if let level = hudBatteryLevelCandidate() {
             updateActiveBluetoothHUDBattery(with: level)
+        }
+    }
+
+    /// Detects non-audio accessories (e.g. Apple Watch) from pmset entries and updates the published array.
+    private func updateNonAudioAccessories(from entries: [PmsetAccessoryBatteryEntry]) {
+        let watchEntries = entries.filter { entry in
+            let name = entry.displayName.lowercased()
+            return name.contains("apple watch") || name.contains("applewatch")
+        }
+
+        guard !watchEntries.isEmpty else { return }
+
+        var updated: [BluetoothAudioDevice] = []
+        for entry in watchEntries {
+            let existing = nonAudioAccessories.first(where: { $0.name == entry.displayName })
+            let device = BluetoothAudioDevice(
+                id: existing?.id ?? UUID(),
+                name: entry.displayName,
+                address: existing?.address ?? "",
+                batteryLevel: entry.level,
+                deviceType: .appleWatch
+            )
+            updated.append(device)
+        }
+
+        nonAudioAccessories = updated
+    }
+
+    /// Manually triggers a pmset refresh to detect non-audio accessories like Apple Watch.
+    func refreshNonAudioAccessories() {
+        pmsetFetchQueue.async { [weak self] in
+            guard let self else { return }
+            let entries = self.collectPmsetAccessoryBatteryEntries()
+            DispatchQueue.main.async {
+                self.updateNonAudioAccessories(from: entries)
+            }
         }
     }
 
@@ -1284,22 +1362,32 @@ class BluetoothAudioManager: ObservableObject {
 
         for (key, value) in deviceCache {
             guard let payload = value as? [String: Any] else { continue }
-            guard let level = extractBatteryPercentage(from: payload) else { continue }
+            let subLevels = extractSubComponentLevels(from: payload)
+            guard let level = subLevels.overall else { continue }
             let clamped = clampBatteryPercentage(level)
 
             let normalizedKey = normalizeBluetoothIdentifier(key)
             if !normalizedKey.isEmpty {
                 addressPercentages[normalizedKey] = max(addressPercentages[normalizedKey] ?? clamped, clamped)
+                if let left = subLevels.left { batteryStatusByAddressLeft[normalizedKey] = max(batteryStatusByAddressLeft[normalizedKey] ?? 0, clampBatteryPercentage(left)) }
+                if let right = subLevels.right { batteryStatusByAddressRight[normalizedKey] = max(batteryStatusByAddressRight[normalizedKey] ?? 0, clampBatteryPercentage(right)) }
+                if let caseLevel = subLevels.caseLevel { batteryStatusByAddressCase[normalizedKey] = max(batteryStatusByAddressCase[normalizedKey] ?? 0, clampBatteryPercentage(caseLevel)) }
             }
 
             for identifier in identifiersFromDeviceCachePayload(payload) {
                 addressPercentages[identifier] = max(addressPercentages[identifier] ?? clamped, clamped)
+                if let left = subLevels.left { batteryStatusByAddressLeft[identifier] = max(batteryStatusByAddressLeft[identifier] ?? 0, clampBatteryPercentage(left)) }
+                if let right = subLevels.right { batteryStatusByAddressRight[identifier] = max(batteryStatusByAddressRight[identifier] ?? 0, clampBatteryPercentage(right)) }
+                if let caseLevel = subLevels.caseLevel { batteryStatusByAddressCase[identifier] = max(batteryStatusByAddressCase[identifier] ?? 0, clampBatteryPercentage(caseLevel)) }
             }
 
             if let name = (payload["Name"] as? String) ?? (payload["DeviceName"] as? String) {
                 let normalizedName = normalizeProductName(name)
                 if !normalizedName.isEmpty {
                     namePercentages[normalizedName] = max(namePercentages[normalizedName] ?? clamped, clamped)
+                    if let left = subLevels.left { batteryStatusByNameLeft[normalizedName] = max(batteryStatusByNameLeft[normalizedName] ?? 0, clampBatteryPercentage(left)) }
+                    if let right = subLevels.right { batteryStatusByNameRight[normalizedName] = max(batteryStatusByNameRight[normalizedName] ?? 0, clampBatteryPercentage(right)) }
+                    if let caseLevel = subLevels.caseLevel { batteryStatusByNameCase[normalizedName] = max(batteryStatusByNameCase[normalizedName] ?? 0, clampBatteryPercentage(caseLevel)) }
                 }
             }
         }
@@ -1318,18 +1406,25 @@ class BluetoothAudioManager: ObservableObject {
         if let connectedList = root["device_connected"] as? [[String: [String: Any]]] {
             for deviceGroup in connectedList {
                 for (rawName, payload) in deviceGroup {
-                    guard let percent = extractSystemProfilerBatteryPercentage(from: payload) else { continue }
+                    let subLevels = extractSystemProfilerSubComponentLevels(from: payload)
+                    guard let percent = subLevels.overall else { continue }
                     let clamped = clampBatteryPercentage(percent)
 
                     let normalizedName = normalizeProductName(rawName)
                     if !normalizedName.isEmpty {
                         namePercentages[normalizedName] = max(namePercentages[normalizedName] ?? clamped, clamped)
+                        if let left = subLevels.left { batteryStatusByNameLeft[normalizedName] = clampBatteryPercentage(left) }
+                        if let right = subLevels.right { batteryStatusByNameRight[normalizedName] = clampBatteryPercentage(right) }
+                        if let caseLevel = subLevels.caseLevel { batteryStatusByNameCase[normalizedName] = clampBatteryPercentage(caseLevel) }
                     }
 
                     for address in profilerAddressCandidates(from: payload) {
                         let normalizedAddress = normalizeBluetoothIdentifier(address)
                         if !normalizedAddress.isEmpty {
                             addressPercentages[normalizedAddress] = max(addressPercentages[normalizedAddress] ?? clamped, clamped)
+                            if let left = subLevels.left { batteryStatusByAddressLeft[normalizedAddress] = clampBatteryPercentage(left) }
+                            if let right = subLevels.right { batteryStatusByAddressRight[normalizedAddress] = clampBatteryPercentage(right) }
+                            if let caseLevel = subLevels.caseLevel { batteryStatusByAddressCase[normalizedAddress] = clampBatteryPercentage(caseLevel) }
                         }
                     }
                 }
@@ -1460,38 +1555,49 @@ class BluetoothAudioManager: ObservableObject {
     }
 
     private func extractSystemProfilerBatteryPercentage(from payload: [String: Any]) -> Int? {
-        let preferredKeys = [
-            "device_batteryLevelCase",
-            "device_batteryLevelLeft",
-            "device_batteryLevelRight",
-            "device_batteryLevelMain",
-            "device_batteryLevel",
-            "device_batteryLevelCombined",
-            "device_batteryPercentCombined",
-            "Left Battery Level",
-            "Right Battery Level",
-            "Battery Level",
-            "BatteryPercent"
-        ]
+        return extractSystemProfilerSubComponentLevels(from: payload).overall
+    }
 
-        var values: [Int] = []
+    private func extractSystemProfilerSubComponentLevels(from payload: [String: Any]) -> SubComponentBatteryLevels {
+        var result = SubComponentBatteryLevels()
 
-        for key in preferredKeys {
-            if let raw = payload[key], let converted = convertToBatteryPercentage(raw) {
-                values.append(converted)
-            }
+        // Read sub-component keys individually
+        if let raw = payload["device_batteryLevelMain"], let v = convertToBatteryPercentage(raw) {
+            result.main = v
+        }
+        if let raw = payload["device_batteryLevelLeft"] ?? payload["Left Battery Level"], let v = convertToBatteryPercentage(raw) {
+            result.left = v
+        }
+        if let raw = payload["device_batteryLevelRight"] ?? payload["Right Battery Level"], let v = convertToBatteryPercentage(raw) {
+            result.right = v
+        }
+        if let raw = payload["device_batteryLevelCase"], let v = convertToBatteryPercentage(raw) {
+            result.caseLevel = v
         }
 
-        if values.isEmpty {
-            for (key, raw) in payload where key.lowercased().contains("battery") {
-                if let converted = convertToBatteryPercentage(raw) {
-                    values.append(converted)
+        // Generic battery keys as main fallback
+        if result.main == nil {
+            let genericKeys = ["device_batteryLevel", "device_batteryLevelCombined", "device_batteryPercentCombined", "Battery Level", "BatteryPercent"]
+            for key in genericKeys {
+                if let raw = payload[key], let v = convertToBatteryPercentage(raw) {
+                    result.main = v
+                    break
                 }
             }
         }
 
-        let validValues = values.filter { $0 >= 0 }
-        return validValues.max()
+        // Last resort: scan all battery-containing keys
+        if result.main == nil && result.left == nil && result.right == nil && result.caseLevel == nil {
+            var values: [Int] = []
+            for (key, raw) in payload where key.lowercased().contains("battery") {
+                if let converted = convertToBatteryPercentage(raw), converted >= 0 {
+                    values.append(converted)
+                }
+            }
+            result.main = values.max()
+        }
+
+        return result
     }
 
     private func profilerAddressCandidates(from payload: [String: Any]) -> [String] {
@@ -1529,44 +1635,56 @@ class BluetoothAudioManager: ObservableObject {
     }
 
     private func extractBatteryPercentage(from payload: [String: Any]) -> Int? {
-        let keys = [
-            "BatteryPercent",
-            "BatteryPercentCase",
-            "BatteryPercentLeft",
-            "BatteryPercentRight",
-            "BatteryPercentSingle",
-            "BatteryPercentCombined",
-            "BatteryPercentMain",
-            "device_batteryLevelLeft",
-            "device_batteryLevelRight",
-            "device_batteryLevelMain",
-            "Left Battery Level",
-            "Right Battery Level"
-        ]
+        return extractSubComponentLevels(from: payload).overall
+    }
 
-        var values: [Int] = []
+    private func extractSubComponentLevels(from payload: [String: Any]) -> SubComponentBatteryLevels {
+        var result = SubComponentBatteryLevels()
 
-        for key in keys {
-            guard let raw = payload[key] else { continue }
-            if let converted = convertToBatteryPercentage(raw) {
-                values.append(converted)
+        // Read sub-component keys individually
+        if let raw = payload["BatteryPercentMain"] ?? payload["device_batteryLevelMain"], let v = convertToBatteryPercentage(raw) {
+            result.main = v
+        }
+        if let raw = payload["BatteryPercentLeft"] ?? payload["device_batteryLevelLeft"] ?? payload["Left Battery Level"], let v = convertToBatteryPercentage(raw) {
+            result.left = v
+        }
+        if let raw = payload["BatteryPercentRight"] ?? payload["device_batteryLevelRight"] ?? payload["Right Battery Level"], let v = convertToBatteryPercentage(raw) {
+            result.right = v
+        }
+        if let raw = payload["BatteryPercentCase"], let v = convertToBatteryPercentage(raw) {
+            result.caseLevel = v
+        }
+
+        // Generic battery keys as main fallback
+        if result.main == nil {
+            let genericKeys = ["BatteryPercent", "BatteryPercentSingle", "BatteryPercentCombined"]
+            for key in genericKeys {
+                if let raw = payload[key], let v = convertToBatteryPercentage(raw) {
+                    result.main = v
+                    break
+                }
             }
         }
 
-        if values.isEmpty,
-           let services = payload["Services"] as? [[String: Any]] {
-            for service in services {
-                if let serviceValues = service["BatteryPercentages"] as? [String: Any] {
-                    for value in serviceValues.values {
-                        if let converted = convertToBatteryPercentage(value) {
-                            values.append(converted)
+        // Last resort: Services BatteryPercentages
+        if result.main == nil && result.left == nil && result.right == nil && result.caseLevel == nil {
+            if let services = payload["Services"] as? [[String: Any]] {
+                for service in services {
+                    if let serviceValues = service["BatteryPercentages"] as? [String: Any] {
+                        var values: [Int] = []
+                        for value in serviceValues.values {
+                            if let converted = convertToBatteryPercentage(value) {
+                                values.append(converted)
+                            }
                         }
+                        result.main = values.max()
+                        if result.main != nil { break }
                     }
                 }
             }
         }
 
-        return values.max()
+        return result
     }
 
     private func convertToBatteryPercentage(_ value: Any) -> Int? {
@@ -1829,6 +1947,8 @@ class BluetoothAudioManager: ObservableObject {
         
         pollingTimer?.invalidate()
         pollingTimer = nil
+        nonAudioPollingTimer?.invalidate()
+        nonAudioPollingTimer = nil
         
         let dnc = DistributedNotificationCenter.default()
         dnc.removeObserver(self)
@@ -1842,6 +1962,52 @@ class BluetoothAudioManager: ObservableObject {
     @MainActor
     func refreshConnectedDeviceBatteries() {
         refreshBatteryLevelsForConnectedDevices()
+    }
+
+    /// Full refresh: re-enumerate connected audio devices from IOBluetooth, update battery levels,
+    /// and scan for non-audio accessories (Apple Watch).
+    /// Unlike checkForDeviceChanges() (which only acts on deltas), this always re-populates
+    /// connectedDevices from scratch, so the view always gets fresh data.
+    @MainActor
+    func refreshDeviceList() {
+        guard IOBluetoothHostController.default()?.powerState == kBluetoothHCIPowerStateON else {
+            if !connectedDevices.isEmpty {
+                connectedDevices.removeAll()
+                isBluetoothAudioConnected = false
+            }
+            refreshNonAudioAccessories()
+            return
+        }
+
+        guard let pairedDevices = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] else {
+            refreshNonAudioAccessories()
+            return
+        }
+
+        let connectedAudioDevices = pairedDevices.filter { $0.isConnected() && isAudioDevice($0) }
+        var newDevices = connectedAudioDevices.compactMap { createBluetoothAudioDevice(from: $0) }
+
+        // Preserve existing IDs so ForEach identities in SwiftUI stay stable
+        for i in newDevices.indices {
+            if let match = connectedDevices.first(where: { $0.address == newDevices[i].address }) {
+                newDevices[i] = BluetoothAudioDevice(
+                    id: match.id,
+                    name: newDevices[i].name,
+                    address: newDevices[i].address,
+                    batteryLevel: newDevices[i].batteryLevel,
+                    batteryLevelLeft: newDevices[i].batteryLevelLeft,
+                    batteryLevelRight: newDevices[i].batteryLevelRight,
+                    batteryLevelCase: newDevices[i].batteryLevelCase,
+                    deviceType: newDevices[i].deviceType
+                )
+            }
+        }
+
+        connectedDevices = newDevices
+        isBluetoothAudioConnected = !connectedDevices.isEmpty
+
+        refreshBatteryLevelsForConnectedDevices()
+        refreshNonAudioAccessories()
     }
 
     @MainActor
@@ -2111,11 +2277,27 @@ private final class BluetoothLEBatteryReader: NSObject, CBCentralManagerDelegate
 
 // MARK: - Models
 
-struct BluetoothAudioDevice: Identifiable {
+/// Helper struct for carrying sub-component battery levels extracted from system_profiler / UserDefaults.
+struct SubComponentBatteryLevels {
+    var main: Int?
+    var left: Int?
+    var right: Int?
+    var caseLevel: Int?
+
+    /// The "overall" value used for single-value display (max of all non-nil values).
+    var overall: Int? {
+        [main, left, right, caseLevel].compactMap { $0 }.max()
+    }
+}
+
+struct BluetoothAudioDevice: Identifiable, Equatable {
     let id: UUID
     let name: String
     let address: String
-    let batteryLevel: Int?  // 0-100, nil if not available
+    let batteryLevel: Int?        // 0-100, overall / max
+    let batteryLevelLeft: Int?    // left earbud (AirPods)
+    let batteryLevelRight: Int?   // right earbud (AirPods)
+    let batteryLevelCase: Int?    // charging case (AirPods)
     let deviceType: BluetoothAudioDeviceType
 
     init(
@@ -2123,23 +2305,37 @@ struct BluetoothAudioDevice: Identifiable {
         name: String,
         address: String,
         batteryLevel: Int?,
+        batteryLevelLeft: Int? = nil,
+        batteryLevelRight: Int? = nil,
+        batteryLevelCase: Int? = nil,
         deviceType: BluetoothAudioDeviceType
     ) {
         self.id = id
         self.name = name
         self.address = address
         self.batteryLevel = batteryLevel
+        self.batteryLevelLeft = batteryLevelLeft
+        self.batteryLevelRight = batteryLevelRight
+        self.batteryLevelCase = batteryLevelCase
         self.deviceType = deviceType
     }
 }
 
 extension BluetoothAudioDevice {
-    func withBatteryLevel(_ batteryLevel: Int?) -> BluetoothAudioDevice {
+    func withBatteryLevel(
+        _ batteryLevel: Int?,
+        left: Int? = nil,
+        right: Int? = nil,
+        caseLevel: Int? = nil
+    ) -> BluetoothAudioDevice {
         BluetoothAudioDevice(
             id: id,
             name: name,
             address: address,
             batteryLevel: batteryLevel,
+            batteryLevelLeft: left ?? batteryLevelLeft,
+            batteryLevelRight: right ?? batteryLevelRight,
+            batteryLevelCase: caseLevel ?? batteryLevelCase,
             deviceType: deviceType
         )
     }
@@ -2157,6 +2353,7 @@ enum BluetoothAudioDeviceType {
     case beatssolo
     case headphones
     case speaker
+    case appleWatch
     case generic
     
     var sfSymbol: String {
@@ -2183,6 +2380,8 @@ enum BluetoothAudioDeviceType {
             return "headphones"
         case .speaker:
             return "hifispeaker.fill"
+        case .appleWatch:
+            return "applewatch"
         case .generic:
             return "bluetooth.circle.fill"
         }
@@ -2201,7 +2400,18 @@ enum BluetoothAudioDeviceType {
         case .beatssolo: return "Beats Solo"
         case .headphones: return "Headphones"
         case .speaker: return "Speaker"
+        case .appleWatch: return "Apple Watch"
         case .generic: return "Bluetooth Device"
+        }
+    }
+
+    /// Whether this device type supports sub-component batteries (left/right/case).
+    var isAirPodsType: Bool {
+        switch self {
+        case .airpods, .airpodsGen3, .airpodsGen4, .airpodsPro, .airpodsPro3, .airpodsMax:
+            return true
+        default:
+            return false
         }
     }
 

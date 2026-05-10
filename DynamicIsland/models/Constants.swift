@@ -934,6 +934,8 @@ extension Defaults.Keys {
     static let showBluetoothBatteryPercentageText = Key<Bool>("showBluetoothBatteryPercentageText", default: false)
     static let showBluetoothDeviceNameMarquee = Key<Bool>("showBluetoothDeviceNameMarquee", default: false)
     static let useBluetoothHUD3DIcon = Key<Bool>("useBluetoothHUD3DIcon", default: true)
+    static let showBluetoothBatteryHomeWidget = Key<Bool>("showBluetoothBatteryHomeWidget", default: false)
+    static let homeBatteryDisplayStyle = Key<HomeBatteryDisplayStyle>("homeBatteryDisplayStyle", default: .ring)
     
     // MARK: Stats Feature
     static let enableStatsFeature = Key<Bool>("enableStatsFeature", default: false)
