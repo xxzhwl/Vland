@@ -366,6 +366,48 @@ struct AIAgentSettings: View {
                     Text("通知与音效")
                 }
 
+                // MARK: Breathing Halo
+                @Default(.aiAgentBreathingHaloEnabled) var breathingHaloEnabled
+                @Default(.aiAgentBreathingHaloIntensity) var breathingHaloIntensity
+
+                Section {
+                    Defaults.Toggle(key: .aiAgentBreathingHaloEnabled) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("状态呼吸灯")
+                            Text("在凹槽折叠态为活跃 AI 会话渲染状态化呼吸光晕。")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if breathingHaloEnabled {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("光晕强度")
+                                .font(.subheadline)
+
+                            Picker("", selection: $breathingHaloIntensity) {
+                                ForEach(AIAgentBreathingIntensity.allCases, id: \.self) { intensity in
+                                    Text(intensity.displayName).tag(intensity)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+
+                            Text("控制呼吸灯外发光和描边的明暗幅度。")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.top, 4)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+
+                        // MARK: Breathing Halo Preview
+                        BreathingHaloPreview(intensity: breathingHaloIntensity)
+                            .padding(.top, 8)
+                            .padding(.bottom, 4)
+                    }
+                } header: {
+                    Text("状态呼吸灯")
+                }
+
                 // MARK: Chat Display
                 Section {
                     Defaults.Toggle(key: .aiAgentShowThinkingBlocks) {
@@ -910,5 +952,150 @@ struct AIAgentSettings: View {
         iconImportError = nil
     }
 
+}
+
+// MARK: - Breathing Halo Preview
+
+/// A live preview of the breathing halo animation for settings.
+/// Shows a small capsule with the selected status color/animation,
+/// along with status selector buttons.
+private struct BreathingHaloPreview: View {
+    let intensity: AIAgentBreathingIntensity
+
+    @State private var previewStatus: AIAgentStatus = .thinking
+    @State private var isAtMax: Bool = false
+    @State private var sweepPhase: CGFloat = 0
+
+    private let previewSize: CGSize = CGSize(width: 160, height: 26)
+
+    private static let statusOptions: [AIAgentStatus] = [.thinking, .coding, .waitingInput, .completed, .error]
+
+    var body: some View {
+        VStack(spacing: 10) {
+            // Mini capsule preview
+            ZStack {
+                let style = previewStatus.breathingStyle
+                let scale = intensity.scaleFactor
+                let opacity = isAtMax ? style.opacityRange.upperBound : style.opacityRange.lowerBound
+                let radius = (isAtMax ? style.radiusRange.upperBound : style.radiusRange.lowerBound) * scale
+                let strokeOpacity = min(opacity * 1.6, 0.55)
+
+                // Outer glow
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(style.color)
+                    .frame(width: previewSize.width, height: previewSize.height)
+                    .opacity(opacity * scale)
+                    .blur(radius: radius)
+                    .scaleEffect(0.98)
+
+                // Inner stroke
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(style.color.opacity(strokeOpacity), lineWidth: style.strokeWidth)
+                    .frame(width: previewSize.width, height: previewSize.height)
+                    .blendMode(.plusLighter)
+
+                // Sweep highlight (only for states that use it)
+                if style.usesSweep {
+                    let barThickness: CGFloat = 2.4
+                    let halfArc = style.sweepArcLength / 2
+                    let lo = sweepPhase - halfArc
+                    let hi = sweepPhase + halfArc
+
+                    ForEach(Array(trimRanges(lo: lo, hi: hi).enumerated()), id: \.offset) { _, segment in
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .trim(from: segment.from, to: segment.to)
+                            .stroke(
+                                style.color.opacity(0.85),
+                                style: StrokeStyle(lineWidth: barThickness + 0.6, lineCap: .round, lineJoin: .round)
+                            )
+                            .frame(width: previewSize.width, height: previewSize.height)
+                            .blendMode(.plusLighter)
+                            .blur(radius: 0.6)
+                    }
+                }
+
+                // Preview labels
+                VStack(spacing: 2) {
+                    Text(previewStatus.displayName)
+                        .font(.caption2.bold())
+                        .foregroundColor(.white.opacity(0.9))
+                }
+            }
+            .frame(width: previewSize.width, height: previewSize.height)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.black.opacity(0.85))
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .onAppear { startAnimation(for: previewStatus) }
+            .onChange(of: previewStatus) { _, newStatus in startAnimation(for: newStatus) }
+
+            // Status selector buttons
+            HStack(spacing: 6) {
+                ForEach(Self.statusOptions, id: \.self) { status in
+                    Button {
+                        previewStatus = status
+                    } label: {
+                        Circle()
+                            .fill(status.breathingStyle.color)
+                            .frame(width: 16, height: 16)
+                            .overlay(
+                                Circle()
+                                    .stroke(Color.white.opacity(previewStatus == status ? 0.6 : 0.2),
+                                            lineWidth: previewStatus == status ? 2 : 1)
+                            )
+                            .shadow(color: status.breathingStyle.color.opacity(0.4), radius: 3)
+                    }
+                    .buttonStyle(.plain)
+                    .help(status.displayName)
+                }
+            }
+        }
+        .padding(.vertical, 6)
+        .padding(.horizontal, 12)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(.windowBackgroundColor).opacity(0.5))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color(.separatorColor).opacity(0.3), lineWidth: 0.5)
+        )
+    }
+
+    private func startAnimation(for status: AIAgentStatus) {
+        isAtMax = false
+        sweepPhase = 0
+
+        let style = status.breathingStyle
+
+        if style.isLooping {
+            withAnimation(.easeInOut(duration: style.period / 2).repeatForever(autoreverses: style.autoreverses)) {
+                isAtMax = true
+            }
+        } else {
+            withAnimation(.easeInOut(duration: style.period * 0.3)) {
+                isAtMax = true
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + style.period * 0.6) {
+                withAnimation(.easeInOut(duration: style.period * 0.4)) {
+                    isAtMax = false
+                }
+            }
+        }
+
+        if style.usesSweep {
+            withAnimation(.easeInOut(duration: max(0.3, style.period)).repeatForever(autoreverses: true)) {
+                sweepPhase = 1.0
+            }
+        }
+    }
+
+    private func trimRanges(lo: CGFloat, hi: CGFloat) -> [(from: CGFloat, to: CGFloat)] {
+        if lo >= 0, hi <= 1 { return [(lo, hi)] }
+        if lo < 0, hi <= 1 { return [(max(0, 1 + lo), 1), (0, max(0, hi))] }
+        if lo >= 0, hi > 1 { return [(lo, 1), (0, min(1, hi - 1))] }
+        return [(0, 1)]
+    }
 }
 

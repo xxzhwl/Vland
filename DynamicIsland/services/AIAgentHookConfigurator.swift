@@ -594,7 +594,7 @@ final class AIAgentHookConfigurator: ObservableObject {
         lines.append("hooks_auto_accept: true")
         lines.append("hooks:")
 
-        let command = "\"\(Self.bridgePath)\" --source hermes"
+        let command = "\(Self.bridgePath) --source hermes"
         for hookType in hookTypes {
             lines.append("  \(hookType.name):")
             lines.append("    - command: \(command)")

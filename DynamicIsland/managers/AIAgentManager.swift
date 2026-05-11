@@ -197,6 +197,17 @@ final class AIAgentManager: ObservableObject {
         !sessionsAwaitingApproval.isEmpty
     }
 
+    /// The highest-priority breathing-relevant status across all active sessions.
+    /// Returns nil when no session has a visible status, allowing BreathingHaloView
+    /// to completely skip rendering (zero frame / zero cost).
+    var dominantBreathingStatus: AIAgentStatus? {
+        let candidates = activeSessions
+            .map(\.status)
+            .filter(\.shouldRenderBreathingHalo)
+        guard !candidates.isEmpty else { return nil }
+        return candidates.min(by: { $0.breathingPriority < $1.breathingPriority })
+    }
+
     private var activeSessionVisibilityTimeout: TimeInterval {
         let cleanupThreshold = TimeInterval(max(1, Defaults[.aiAgentAutoCleanupMinutes])) * 60
         return max(minimumActiveSessionVisibilityTimeout, cleanupThreshold)

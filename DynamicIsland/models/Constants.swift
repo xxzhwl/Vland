@@ -970,6 +970,10 @@ extension Defaults.Keys {
     static let aiAgentQuotaShowRing = Key<Bool>("aiAgentQuotaShowRing", default: true)
     static let aiAgentQuotaShowInlineBar = Key<Bool>("aiAgentQuotaShowInlineBar", default: true)
 
+    // MARK: AI Agent Breathing Halo
+    static let aiAgentBreathingHaloEnabled = Key<Bool>("aiAgentBreathingHaloEnabled", default: true)
+    static let aiAgentBreathingHaloIntensity = Key<AIAgentBreathingIntensity>("aiAgentBreathingHaloIntensity", default: .medium)
+
     // MARK: AI Agent Card Theme
     static let aiAgentThemeMode = Key<AIAgentThemeMode>("aiAgentThemeMode", default: .perAgent)
     static let aiAgentCardTheme = Key<AIAgentCardTheme>("aiAgentCardTheme", default: .minimal)

@@ -407,6 +407,27 @@ struct ContentView: View {
                 .padding([.horizontal, .bottom], vm.notchState == .open ? 12 : 0)
                 .background(.black)
                 .clipShape(resolvedClipShape)
+                // Breathing halo must be attached AFTER clipShape so its outer glow
+                // (blur) is not clipped by the same mask. The halo sits behind the
+                // notch content but its blur extends beyond the contour.
+                .background(alignment: .top) {
+                    let isClosed = vm.notchState == .closed
+                    if isClosed && Defaults[.enableAIAgentFeature] && !vm.hideOnClosed {
+                        BreathingHaloView(
+                            shape: resolvedClipShape,
+                            notchSize: nil,  // nil → GeometryReader, adapts to parent
+                            isIslandMode: isIslandMode,
+                            topCornerRadius: activeCornerRadiusInsets.closed.top,
+                            bottomCornerRadius: activeCornerRadiusInsets.closed.bottom,
+                            pillCornerRadius: max(
+                                vm.closedNotchSize.height / 2,
+                                dynamicIslandPillCornerRadiusInsets.closed.standard
+                            )
+                        )
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                    }
+                }
                 .compositingGroup()
                 .shadow(
                     color: ((vm.notchState == .open || isHovering) && Defaults[.enableShadow])
