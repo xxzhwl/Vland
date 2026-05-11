@@ -26,7 +26,7 @@ import hashlib
 import uuid
 from datetime import datetime
 
-VLAND_BRIDGE_VERSION = "2026.05.10.1"
+VLAND_BRIDGE_VERSION = "2026.05.11.1"
 
 SOCKET_PATH = os.path.join(os.environ.get("TMPDIR", "/tmp"), "vland-ai-agent.sock")
 
@@ -1376,7 +1376,11 @@ def extract_claude_hook_subtasks(stdin_data):
             or stdin_data.get("message")
         )
 
-    title = normalize_subtask_title(f"{agent_type} subagent") or "Subagent"
+    prompt = stdin_data.get("prompt") or stdin_data.get("description")
+    if prompt and isinstance(prompt, str) and prompt.strip():
+        title = normalize_subtask_title(prompt) or agent_type
+    else:
+        title = agent_type
     return [{
         "id": str(agent_id or f"claude-subagent-{agent_type}"),
         "kind": "subagent",
