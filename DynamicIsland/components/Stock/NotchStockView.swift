@@ -29,7 +29,10 @@ struct NotchStockView: View {
 
     @State private var isSortByChange = false
     @State private var chartStock: Stock?
+    @State private var chartMode: ChartMode = .trend
     @State private var selectedMarket: Market? = nil
+
+    private enum ChartMode { case trend, kline }
 
     /// 分组数据
     private var groupedStocks: [(Market, [Stock])] {
@@ -95,7 +98,21 @@ struct NotchStockView: View {
     var body: some View {
         Group {
         if let stock = chartStock {
-            StockKLineChartView(stock: stock, onBack: { chartStock = nil })
+            switch chartMode {
+            case .trend:
+                StockTrendChartView(
+                    stock: stock,
+                    quote: stockManager.quotes[stock.id],
+                    onBack: { chartStock = nil; chartMode = .trend },
+                    onSwitchToKLine: { chartMode = .kline }
+                )
+            case .kline:
+                StockKLineChartView(
+                    stock: stock,
+                    onBack: { chartStock = nil; chartMode = .trend },
+                    onSwitchToTrend: { chartMode = .trend }
+                )
+            }
         } else {
             VStack(alignment: .leading, spacing: 6) {
             // 盈亏汇总

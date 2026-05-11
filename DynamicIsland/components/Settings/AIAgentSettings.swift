@@ -65,6 +65,7 @@ struct AIAgentSettings: View {
             "workbuddy": 3,
             "cursor": 4,
             "gemini-cli": 5,
+            "hermes": 6,
         ]
 
         return agents.sorted { lhs, rhs in
@@ -601,6 +602,7 @@ struct AIAgentSettings: View {
         case "cursor": return "cursorarrow.rays"
         case "codex": return "chevron.left.forwardslash.chevron.right"
         case "gemini-cli": return "sparkles"
+        case "hermes": return "bolt.horizontal.circle.fill"
         case "workbuddy": return "briefcase.fill"
         default: return "questionmark.circle"
         }
@@ -613,6 +615,7 @@ struct AIAgentSettings: View {
         case "cursor": return .purple
         case "codex": return .green
         case "gemini-cli": return .cyan
+        case "hermes": return .pink
         case "workbuddy": return .indigo
         default: return .gray
         }
@@ -822,6 +825,7 @@ struct AIAgentSettings: View {
         case .cursor: return (home as NSString).appendingPathComponent(".cursor")
         case .codex: return (home as NSString).appendingPathComponent(".codex")
         case .geminiCLI: return (home as NSString).appendingPathComponent(".gemini")
+        case .hermes: return (home as NSString).appendingPathComponent(".hermes")
         case .workbuddy: return (home as NSString).appendingPathComponent(".workbuddy")
         }
     }

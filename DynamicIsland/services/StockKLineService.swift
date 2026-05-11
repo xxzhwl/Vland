@@ -112,11 +112,106 @@ final class StockKLineService {
         return (1, code)
     }
 
-    // MARK: - East Money Intraday Trend
+    // MARK: - Intraday Trend
 
     /// Fetch intraday price trend (1-min intervals) for a stock.
-    /// Uses East Money trends2 API which returns the most recent trading day's minute-level data.
+    /// Tries: Tencent (A/HK) → Yahoo (US) → East Money (fallback).
     static func fetchIntradayTrend(code: String) async throws -> [TrendPoint] {
+        do {
+            if code.hasPrefix("usr_") {
+                return try await fetchTrendUS(code: code)
+            }
+            return try await fetchTrendTencent(code: code)
+        } catch {
+            return try await fetchTrendEastMoney(code: code)
+        }
+    }
+
+    // MARK: - Yahoo Finance Intraday Trend (美股, 04:00-20:00 ET)
+
+    private static func fetchTrendUS(code: String) async throws -> [TrendPoint] {
+        let ticker = code
+            .replacingOccurrences(of: "usr_", with: "")
+            .replacingOccurrences(of: "$", with: "-")
+            .uppercased()
+        let urlStr = "https://query1.finance.yahoo.com/v8/finance/chart/\(ticker)?interval=1m&range=1d&includePrePost=true"
+        guard let url = URL(string: urlStr) else { throw KLineError.invalidURL }
+        var request = URLRequest(url: url)
+        request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 10
+
+        let (data, _) = try await URLSession.shared.data(for: request)
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let chart = root["chart"] as? [String: Any],
+              let results = chart["result"] as? [[String: Any]],
+              let result = results.first,
+              let timestamps = result["timestamp"] as? [Double],
+              let indicators = result["indicators"] as? [String: Any],
+              let quoteArr = indicators["quote"] as? [[String: Any]],
+              let rawCloses = quoteArr.first?["close"] as? [Any]
+        else { throw KLineError.invalidResponse }
+
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "America/New_York")!
+        let fmt = DateFormatter()
+        fmt.timeZone = cal.timeZone
+        fmt.dateFormat = "HH:mm"
+
+        let points: [TrendPoint] = timestamps.enumerated().compactMap { (i, ts) in
+            guard i < rawCloses.count,
+                  let price = rawCloses[i] as? Double, price > 0 else { return nil }
+            let date = Date(timeIntervalSince1970: ts)
+            let timeStr = fmt.string(from: date)
+            return TrendPoint(time: timeStr, price: price)
+        }
+
+        guard !points.isEmpty else { throw KLineError.noData }
+        return points
+    }
+
+    // MARK: - Tencent Intraday Trend (A股 / 港股)
+
+    private static func fetchTrendTencent(code: String) async throws -> [TrendPoint] {
+        guard let url = URL(string: "https://web.ifzq.gtimg.cn/appstock/app/minute/query?_var=min_data_\(code)&code=\(code)") else {
+            throw KLineError.invalidURL
+        }
+        let (data, _) = try await URLSession.shared.data(from: url)
+        guard let body = String(data: data, encoding: .utf8),
+              let eqIdx = body.firstIndex(of: "=") else {
+            throw KLineError.invalidResponse
+        }
+        let jsonStr = String(body[body.index(after: eqIdx)...])
+            .trimmingCharacters(in: CharacterSet(charactersIn: ";\n "))
+
+        guard let jsonData = jsonStr.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let dataObj = root["data"] as? [String: Any],
+              let stockData = dataObj[code] as? [String: Any],
+              let innerData = stockData["data"] as? [String: Any],
+              let lines = innerData["data"] as? [String]
+        else { throw KLineError.invalidResponse }
+
+        let points: [TrendPoint] = lines.compactMap { line in
+            let parts = line.components(separatedBy: " ")
+            guard parts.count >= 2, let price = Double(parts[1]), price > 0 else { return nil }
+            let rawTime = parts[0]
+            // Tencent returns "0930" without colon — normalize to "09:30"
+            let time: String
+            if rawTime.count == 4 {
+                time = "\(rawTime.prefix(2)):\(rawTime.suffix(2))"
+            } else {
+                time = rawTime
+            }
+            return TrendPoint(time: time, price: price)
+        }
+
+        guard !points.isEmpty else { throw KLineError.noData }
+        return points
+    }
+
+    // MARK: - East Money Intraday Trend (fallback)
+
+    private static func fetchTrendEastMoney(code: String) async throws -> [TrendPoint] {
         let (marketId, secCode) = eastMoneyCode(code)
         guard let url = URL(string: "https://push2.eastmoney.com/api/qt/stock/trends2/get?secid=\(marketId).\(secCode)&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56&ndays=1") else {
             throw KLineError.invalidURL

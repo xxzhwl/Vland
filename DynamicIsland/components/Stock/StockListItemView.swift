@@ -58,15 +58,15 @@ struct StockListItemView: View {
             }
             .frame(width: 120, alignment: .leading)
 
-            // 中间：日内趋势 sparkline — 始终占位，占满剩余区域
+            // 中间：日内趋势 — 固定时间轴，随时间向右绘制
             Group {
                 if let trend = trend, trend.count >= 2 {
-                    MiniTrendView(prices: trend.map(\.price), color: trendColor(isUp: quote?.isUp ?? true))
+                    MiniTrendView(trendPoints: trend, market: stock.market, color: trendColor(isUp: quote?.isUp ?? true))
                 } else {
                     Color.clear
                 }
             }
-            .frame(height: 16)
+            .frame(height: 26)
 
             // 右侧：价格 + 涨跌幅 + 盈亏金额和盈亏率
             HStack {
@@ -137,29 +137,64 @@ struct StockListItemView: View {
 
 // MARK: - MiniTrendView
 
-/// Small sparkline showing intraday price trend
+/// Sparkline with fixed time axis that draws progressively throughout the day.
+/// The x-axis spans the full trading session (e.g. 09:30–15:00 for A-shares).
+/// Data points appear at their actual time positions, leaving future time slots empty.
 struct MiniTrendView: View {
-    let prices: [Double]
+    let trendPoints: [TrendPoint]
+    let market: Market
     let color: Color
 
     var body: some View {
         GeometryReader { geo in
-            let w = geo.size.width
-            let h = geo.size.height
+            let config = market.tradingConfig
+            let totalMin = CGFloat(config.totalMinutes)
+            let labelH: CGFloat = 9
+            let prices = trendPoints.map(\.price)
             let minP = prices.min() ?? 0
             let maxP = prices.max() ?? 1
             let range = max(maxP - minP, 0.01)
-            let count = prices.count
 
-            Path { path in
-                for (i, p) in prices.enumerated() {
-                    let x = count > 1 ? CGFloat(i) / CGFloat(count - 1) * w : w / 2
-                    let y = h - CGFloat((p - minP) / range) * h
-                    if i == 0 { path.move(to: CGPoint(x: x, y: y)) }
-                    else { path.addLine(to: CGPoint(x: x, y: y)) }
+            ZStack(alignment: .topLeading) {
+                // Line chart
+                Canvas { context, size in
+                    let lineH = size.height - labelH
+                    var prevCumulative: Int?
+                    var linePath = Path()
+                    var needMove = true
+
+                    for point in trendPoints {
+                        guard let cumMin = config.cumulativeMinutes(point.time) else { continue }
+                        let x = CGFloat(cumMin) / totalMin * size.width
+                        let y = lineH - CGFloat((point.price - minP) / range) * lineH
+
+                        if let prev = prevCumulative, cumMin - prev > 5 {
+                            needMove = true
+                        }
+                        if needMove {
+                            linePath.move(to: CGPoint(x: x, y: y))
+                            needMove = false
+                        } else {
+                            linePath.addLine(to: CGPoint(x: x, y: y))
+                        }
+                        prevCumulative = cumMin
+                    }
+                    context.stroke(linePath, with: .color(color), lineWidth: 1)
                 }
+
+                // Time labels at bottom
+                HStack(spacing: 0) {
+                    Text(config.timeLabels.first ?? "")
+                        .font(.system(size: 7))
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Text(config.timeLabels.last ?? "")
+                        .font(.system(size: 7))
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .offset(y: geo.size.height - labelH + 1)
             }
-            .stroke(color, lineWidth: 1)
         }
     }
 }

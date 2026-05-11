@@ -59,6 +59,13 @@ final class AIAgentHookConfigurator: ObservableObject {
         }
     }
 
+    /// Config file format used by the agent.
+    /// Agents like CodeBuddy/Claude Code use JSON; Hermes uses YAML.
+    enum SettingsFormat {
+        case json
+        case yaml
+    }
+
     /// Published detection results for the Settings UI
     @Published var detectedAgents: [DetectedAgent] = []
     @Published var bridgeInstalled: Bool = false
@@ -101,6 +108,7 @@ final class AIAgentHookConfigurator: ObservableObject {
         let settingsFile: String
         let hookTypes: [HookTypeSpec]
         let requiresCodexHookFlag: Bool
+        let settingsFormat: SettingsFormat
     }
 
     private static let defaultHookTypes: [HookTypeSpec] = [
@@ -151,11 +159,28 @@ final class AIAgentHookConfigurator: ObservableObject {
         HookTypeSpec(name: "Stop", matcher: nil, timeoutSeconds: nil),
     ]
 
-    private static let agentTemplates: [(id: String, name: String, defaultConfigDir: String, settingsFileName: String, hookTypes: [HookTypeSpec], requiresCodexHookFlag: Bool)] = [
-        ("codebuddy", "CodeBuddy", ".codebuddy", "settings.json", codebuddyHookTypes, false),
-        ("codex", "Codex CLI", ".codex", "hooks.json", codexHookTypes, true),
-        ("claude-code", "Claude Code", ".claude", "settings.json", claudeHookTypes, false),
-        ("workbuddy", "WorkBuddy", ".workbuddy", "settings.json", codebuddyHookTypes, false),
+    // Hermes uses snake_case event names in its YAML config file.
+    // Normalization to CamelCase happens in the bridge script (--source hermes).
+    private static let hermesHookTypes: [HookTypeSpec] = [
+        HookTypeSpec(name: "on_session_start", matcher: nil, timeoutSeconds: nil),
+        HookTypeSpec(name: "on_session_end", matcher: nil, timeoutSeconds: nil),
+        HookTypeSpec(name: "pre_tool_call", matcher: "*", timeoutSeconds: 86_400),
+        HookTypeSpec(name: "post_tool_call", matcher: "*", timeoutSeconds: nil),
+        HookTypeSpec(name: "pre_approval_request", matcher: "*", timeoutSeconds: 86_400),
+        HookTypeSpec(name: "post_approval_response", matcher: "*", timeoutSeconds: nil),
+        HookTypeSpec(name: "subagent_stop", matcher: nil, timeoutSeconds: nil),
+        HookTypeSpec(name: "on_notification", matcher: "*", timeoutSeconds: nil),
+        HookTypeSpec(name: "on_user_prompt_submit", matcher: nil, timeoutSeconds: nil),
+        HookTypeSpec(name: "pre_llm_call", matcher: nil, timeoutSeconds: nil),
+        HookTypeSpec(name: "post_llm_call", matcher: nil, timeoutSeconds: nil),
+    ]
+
+    private static let agentTemplates: [(id: String, name: String, defaultConfigDir: String, settingsFileName: String, hookTypes: [HookTypeSpec], requiresCodexHookFlag: Bool, settingsFormat: SettingsFormat)] = [
+        ("codebuddy", "CodeBuddy", ".codebuddy", "settings.json", codebuddyHookTypes, false, .json),
+        ("codex", "Codex CLI", ".codex", "hooks.json", codexHookTypes, true, .json),
+        ("claude-code", "Claude Code", ".claude", "settings.json", claudeHookTypes, false, .json),
+        ("workbuddy", "WorkBuddy", ".workbuddy", "settings.json", codebuddyHookTypes, false, .json),
+        ("hermes", "Hermes", ".hermes", "config.yaml", hermesHookTypes, false, .yaml),
     ]
 
     private static func resolvedAgents() -> [AgentDefinition] {
@@ -176,7 +201,8 @@ final class AIAgentHookConfigurator: ObservableObject {
                 configDir: configDir,
                 settingsFile: settingsFile,
                 hookTypes: t.hookTypes,
-                requiresCodexHookFlag: t.requiresCodexHookFlag
+                requiresCodexHookFlag: t.requiresCodexHookFlag,
+                settingsFormat: t.settingsFormat
             )
         }
     }
@@ -249,24 +275,45 @@ final class AIAgentHookConfigurator: ObservableObject {
             var hookStatus: DetectedAgent.HookStatus = .notConfigured
 
             if settingsExists {
-                if let data = fm.contents(atPath: agent.settingsFile),
-                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let hooks = json["hooks"] as? [String: Any]
-                {
-                    let jsonStr = String(data: data, encoding: .utf8) ?? ""
-                    let expectedHookNames = Set(agent.hookTypes.map(\.name))
-                    let configuredVlandHooks = configuredHookNames(in: hooks) { command in
-                        command.contains(Self.bridgePath) || command.contains("vland-bridge")
+                if agent.settingsFormat == .yaml {
+                    guard let raw = try? String(contentsOfFile: agent.settingsFile, encoding: .utf8) else {
+                        continue
                     }
 
-                    if expectedHookNames.isSubset(of: configuredVlandHooks) {
+                    let hasVlandMarkers = raw.contains(Self.hermesMarkerBegin) && raw.contains(Self.hermesMarkerEnd)
+                    let hasVlandCommand = raw.contains(Self.bridgePath) || raw.contains("vland-bridge")
+
+                    if hasVlandMarkers && hasVlandCommand {
                         hookStatus = .configuredVland
-                    } else if jsonStr.contains("vibe-island-bridge") {
+                    } else if raw.contains("vibe-island-bridge") {
                         hookStatus = .configuredOther("vibe-island-bridge")
-                    } else if jsonStr.contains("agent-island-bridge") {
+                    } else if raw.contains("agent-island-bridge") {
                         hookStatus = .configuredOther("agent-island-bridge")
-                    } else if !hooks.isEmpty {
+                    } else if raw.contains("hook") && (raw.contains("command") || raw.contains(" type:")) {
+                        hookStatus = .configuredOther("hermes-custom")
+                    } else {
                         hookStatus = .notConfigured
+                    }
+                } else {
+                    if let data = fm.contents(atPath: agent.settingsFile),
+                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let hooks = json["hooks"] as? [String: Any]
+                    {
+                        let jsonStr = String(data: data, encoding: .utf8) ?? ""
+                        let expectedHookNames = Set(agent.hookTypes.map(\.name))
+                        let configuredVlandHooks = configuredHookNames(in: hooks) { command in
+                            command.contains(Self.bridgePath) || command.contains("vland-bridge")
+                        }
+
+                        if expectedHookNames.isSubset(of: configuredVlandHooks) {
+                            hookStatus = .configuredVland
+                        } else if jsonStr.contains("vibe-island-bridge") {
+                            hookStatus = .configuredOther("vibe-island-bridge")
+                        } else if jsonStr.contains("agent-island-bridge") {
+                            hookStatus = .configuredOther("agent-island-bridge")
+                        } else if !hooks.isEmpty {
+                            hookStatus = .notConfigured
+                        }
                     }
                 }
             }
@@ -533,6 +580,90 @@ final class AIAgentHookConfigurator: ObservableObject {
         return result
     }
 
+    // MARK: - Hermes YAML Managed Block
+
+    private static let hermesMarkerBegin = "# >>> vland hooks >>>"
+    private static let hermesMarkerEnd = "# <<< vland hooks <<<"
+
+    /// Build the YAML managed block for Hermes hooks.
+    /// Only the text between markers is managed; everything outside is preserved.
+    private func buildHermesManagedBlock(hookTypes: [HookTypeSpec]) -> String {
+        var lines: [String] = []
+        lines.append(Self.hermesMarkerBegin)
+        lines.append("# Managed by Vland — do not edit between markers. Re-run \"Configure Hermes\" to refresh.")
+        lines.append("hooks_auto_accept: true")
+        lines.append("hooks:")
+
+        let command = "\"\(Self.bridgePath)\" --source hermes"
+        for hookType in hookTypes {
+            lines.append("  \(hookType.name):")
+            lines.append("    - command: \(command)")
+            lines.append("      type: command")
+            if let matcher = hookType.matcher, !matcher.isEmpty {
+                lines.append("      matcher: \"\(matcher)\"")
+            }
+            if let timeout = hookType.timeoutSeconds {
+                lines.append("      timeout: \(timeout)")
+            }
+        }
+        lines.append(Self.hermesMarkerEnd)
+        lines.append("")
+        return lines.joined(separator: "\n")
+    }
+
+    /// Insert or replace the Vland managed block in existing YAML content.
+    /// If no marker block is found, append at the end of the file.
+    private func upsertHermesManagedBlock(in existingContent: String, block: String) -> String {
+        if let beginRange = existingContent.range(of: Self.hermesMarkerBegin),
+           let endRange = existingContent.range(of: Self.hermesMarkerEnd) {
+            let fullRange = beginRange.lowerBound..<existingContent.index(after: endRange.upperBound)
+            let lineBefore = existingContent[..<beginRange.lowerBound]
+            let afterMarker = existingContent[endRange.upperBound...]
+            let afterContent = afterMarker.drop(while: { $0.isNewline })
+            return lineBefore + block + afterContent
+        } else {
+            var result = existingContent
+            if !result.hasSuffix("\n") {
+                result.append("\n")
+            }
+            result.append(block)
+            return result
+        }
+    }
+
+    /// Write Hermes YAML config with automatic backup.
+    private func writeHermesAgentSettings(
+        for agent: DetectedAgent,
+        definition agentDefinition: AgentDefinition
+    ) -> Bool {
+        let fm = FileManager.default
+        let existing = (try? String(contentsOfFile: agent.settingsPath, encoding: .utf8)) ?? ""
+        let newBlock = buildHermesManagedBlock(hookTypes: agentDefinition.hookTypes)
+        let updated = upsertHermesManagedBlock(in: existing, block: newBlock)
+
+        if fm.fileExists(atPath: agent.settingsPath), existing != updated {
+            let backupPath = agent.settingsPath + ".vland-backup-\(quotaTimestamp())"
+            do {
+                try existing.write(toFile: backupPath, atomically: true, encoding: .utf8)
+                configurationLog.append("  💾 Backed up original to \(backupPath)")
+            } catch {
+                configurationLog.append("  ⚠️ Could not create backup: \(error.localizedDescription)")
+            }
+        }
+
+        do {
+            try updated.write(toFile: agent.settingsPath, atomically: true, encoding: .utf8)
+            configurationLog.append("  ✅ Hermes hooks configured in \(agent.settingsPath)")
+            if let idx = detectedAgents.firstIndex(where: { $0.id == agent.id }) {
+                detectedAgents[idx].hookStatus = .configuredVland
+            }
+            return true
+        } catch {
+            configurationLog.append("  ❌ Failed to write Hermes settings: \(error.localizedDescription)")
+            return false
+        }
+    }
+
     // MARK: - Configuration
 
     func configureAgent(_ agent: DetectedAgent) -> Bool {
@@ -561,6 +692,11 @@ final class AIAgentHookConfigurator: ObservableObject {
                 configurationLog.append("  ❌ Failed to create config dir: \(error.localizedDescription)")
                 return false
             }
+        }
+
+        // Hermes uses YAML with managed marker blocks, not JSON hooks.
+        if agentDefinition.settingsFormat == .yaml {
+            return writeHermesAgentSettings(for: agent, definition: agentDefinition)
         }
 
         var settings: [String: Any] = [:]

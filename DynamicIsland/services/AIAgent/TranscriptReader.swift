@@ -74,7 +74,7 @@ final class TranscriptReader {
                 )
                 return try reader.readCodexTranscript(from: path)
 
-            case .cursor, .geminiCLI, .workbuddy:
+            case .cursor, .geminiCLI, .hermes, .workbuddy:
                 throw TranscriptReaderError.unsupportedAgent
             }
         }.value

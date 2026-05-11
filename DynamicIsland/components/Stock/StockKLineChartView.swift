@@ -24,6 +24,7 @@ import Defaults
 struct StockKLineChartView: View {
     let stock: Stock
     let onBack: () -> Void
+    let onSwitchToTrend: (() -> Void)?
 
     @State private var data: [KLinePoint] = []
     @State private var isLoading = true
@@ -53,6 +54,27 @@ struct StockKLineChartView: View {
                 }
             }
             .buttonStyle(.plain)
+
+            HStack(spacing: 0) {
+                if let onSwitch = onSwitchToTrend {
+                    Button("分时") {
+                        onSwitch()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                }
+
+                Text("日K")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.primary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color.primary.opacity(0.15))
+                    .cornerRadius(3)
+            }
 
             Spacer()
 

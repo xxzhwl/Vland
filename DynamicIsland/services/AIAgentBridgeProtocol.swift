@@ -155,6 +155,17 @@ enum AIAgentBridgeProtocol {
                 ]
             ]
 
+        case "hermes_approval":
+            // Hermes hooks expect a top-level `decision` field.
+            // `block` halts the tool call; any other response lets execution proceed.
+            if isBlockOption(option) {
+                return [
+                    "decision": "block",
+                    "reason": "User rejected from Vland",
+                ]
+            }
+            return ["decision": "allow"]
+
         default:
             return nil
         }

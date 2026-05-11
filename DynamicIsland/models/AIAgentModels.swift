@@ -28,6 +28,7 @@ enum AIAgentType: String, Codable, CaseIterable, Identifiable {
     case cursor = "cursor"
     case codex = "codex"
     case geminiCLI = "gemini-cli"
+    case hermes = "hermes"
     case workbuddy = "workbuddy"
 
     var id: String { rawValue }
@@ -39,6 +40,7 @@ enum AIAgentType: String, Codable, CaseIterable, Identifiable {
         case .cursor: return "Cursor"
         case .codex: return "Codex"
         case .geminiCLI: return "Gemini CLI"
+        case .hermes: return "Hermes"
         case .workbuddy: return "WorkBuddy"
         }
     }
@@ -50,6 +52,7 @@ enum AIAgentType: String, Codable, CaseIterable, Identifiable {
         case .cursor: return "cursorarrow.rays"
         case .codex: return "chevron.left.forwardslash.chevron.right"
         case .geminiCLI: return "sparkles"
+        case .hermes: return "bolt.horizontal.circle.fill"
         case .workbuddy: return "briefcase.fill"
         }
     }
@@ -61,6 +64,7 @@ enum AIAgentType: String, Codable, CaseIterable, Identifiable {
         case .cursor: return .purple
         case .codex: return .green
         case .geminiCLI: return .cyan
+        case .hermes: return .pink
         case .workbuddy: return .indigo
         }
     }
@@ -74,6 +78,7 @@ enum AIAgentType: String, Codable, CaseIterable, Identifiable {
         case .cursor: return ["com.todesktop.230313mzl4w4u92"]
         case .codex: return ["com.openai.codex"]
         case .geminiCLI: return []
+        case .hermes: return []
         case .workbuddy: return []
         }
     }
@@ -86,6 +91,7 @@ enum AIAgentType: String, Codable, CaseIterable, Identifiable {
         case .cursor: return ["Cursor"]
         case .codex: return ["Codex"]
         case .geminiCLI: return []
+        case .hermes: return []
         case .workbuddy: return ["WorkBuddy"]
         }
     }
@@ -99,7 +105,7 @@ enum AIAgentType: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .codebuddy, .claudeCode, .codex:
             return true
-        case .cursor, .geminiCLI, .workbuddy:
+        case .cursor, .geminiCLI, .hermes, .workbuddy:
             return false
         }
     }
