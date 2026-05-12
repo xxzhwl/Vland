@@ -691,20 +691,19 @@ struct NotchHomeView: View {
 
                     let showCameraInHome = webcamManager.isSessionRunning && webcamManager.cameraAvailable
 
-                    if Defaults[.showBluetoothBatteryHomeWidget] || showCameraInHome {
-                        ZStack {
-                            if showCameraInHome {
-                                CameraPreviewView(webcamManager: webcamManager)
-                                    .scaledToFit()
-                                    .transition(.opacity.combined(with: .scale(scale: 0.85)))
-                            } else {
-                                BluetoothBatteryHomeView()
-                                    .transition(.opacity.combined(with: .scale(scale: 0.85)))
-                            }
+                    Group {
+                        if showCameraInHome {
+                            CameraPreviewView(webcamManager: webcamManager)
+                                .scaledToFit()
+                                .transition(.opacity.combined(with: .scale(scale: 0.85)))
+                                .frame(maxWidth: 200)
+                        } else {
+                            HomeRightPanelHost()
+                                .transition(.opacity.combined(with: .scale(scale: 0.85)))
+                                .frame(maxWidth: 200)
                         }
-                        .animation(.smooth(duration: 0.35), value: showCameraInHome)
-                        .frame(maxWidth: 200)
                     }
+                    .animation(.smooth(duration: 0.35), value: showCameraInHome)
                 }
             }
 

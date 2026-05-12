@@ -713,6 +713,46 @@ struct NoteItem: Codable, Identifiable, Defaults.Serializable, Hashable {
     }
 }
 
+// MARK: - Home Right Panel Content
+
+enum HomeRightPanelContent: String, Defaults.Serializable, CaseIterable, Identifiable {
+    case systemStats
+    case weather
+    case hidden
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .systemStats: return String(localized: "System Stats")
+        case .weather:     return String(localized: "Weather")
+        case .hidden:      return String(localized: "Hidden")
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .systemStats: return "cpu"
+        case .weather:     return "cloud.sun"
+        case .hidden:      return "eye.slash"
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .systemStats: return String(localized: "CPU, memory and network usage")
+        case .weather:     return String(localized: "Current weather conditions")
+        case .hidden:      return String(localized: "Hide right panel")
+        }
+    }
+
+    /// Cards that participate in swipe pagination. `.hidden` is excluded —
+    /// once hidden by the user, swiping won't bring it back.
+    static var pageable: [HomeRightPanelContent] {
+        [.systemStats, .weather]
+    }
+}
+
 extension Defaults.Keys {
         // MARK: General
     static let menubarIcon = Key<Bool>("menubarIcon", default: true)
@@ -1165,6 +1205,9 @@ extension Defaults.Keys {
     // MARK: Lyrics Feature
     static let enableLyrics = Key<Bool>("enableLyrics", default: false)
     
+    // MARK: Home Right Panel
+    static let homeRightPanelContent = Key<HomeRightPanelContent>("homeRightPanelContent", default: .systemStats)
+
     // MARK: Tab Reordering
     static let enableTabReordering = Key<Bool>("enableTabReordering", default: true)
     static let customTabOrder = Key<[String]>("customTabOrder", default: [])

@@ -2154,6 +2154,7 @@ struct ContentView: View {
             && !lockScreenManager.isLocked
             && !hasAnyActivePopovers()
             && !vm.isHoveringCalendar
+            && !vm.isHoveringRightPanel
             && !vm.isScrollGestureActive
     }
 
